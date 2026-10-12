@@ -3,8 +3,10 @@
 use std::f64::consts::PI;
 use std::path::Path;
 
+use horizonlab_core::kerr::{self, Kerr, KerrState};
 use horizonlab_core::{
-    escape_angle, initial_state, trace, Capture, SphericalMetric, State, Termination, TraceConfig,
+    escape_angle, initial_state, refine_crossing, trace, Capture, SphericalMetric, State,
+    Termination, TraceConfig,
 };
 
 use crate::vec3::Vec3;
@@ -59,23 +61,30 @@ impl Camera {
 /// Emission uses the Newtonian thin-disk flux profile
 /// `F(r) ∝ r⁻³ (1 - √(r_in/r))` — a placeholder for Novikov–Thorne, which
 /// needs metric-specific orbital quantities.
+///
+/// The normalisation is absolute (same accretion rate for every disk):
+/// `F = 1` at the peak of a disk with `r_in = 6M`. Disks reaching closer in
+/// (Kerr ISCO, JMN-1 interior) are correspondingly brighter and hotter, so
+/// images of different spacetimes are directly comparable.
 pub struct Disk {
     pub r_in: f64,
     pub r_out: f64,
-    f_max: f64,
+}
+
+/// Peak of `r⁻³(1 - √(6/r))`, reached at `r = (49/36)·6`.
+fn reference_flux_peak() -> f64 {
+    let r: f64 = 49.0 / 36.0 * 6.0;
+    r.powi(-3) * (1.0 - (6.0 / r).sqrt())
 }
 
 impl Disk {
     pub fn new(r_in: f64, r_out: f64) -> Self {
         assert!(r_in > 0.0 && r_out > r_in, "need 0 < r_in < r_out");
-        let profile = |r: f64| r.powi(-3) * (1.0 - (r_in / r).sqrt());
-        // Peak of the profile is at r = (49/36) r_in.
-        let f_max = profile((49.0 / 36.0) * r_in);
-        Self { r_in, r_out, f_max }
+        Self { r_in, r_out }
     }
 
     fn flux(&self, r: f64) -> f64 {
-        (r.powi(-3) * (1.0 - (self.r_in / r).sqrt())).max(0.0) / self.f_max
+        (r.powi(-3) * (1.0 - (self.r_in / r).sqrt())).max(0.0) / reference_flux_peak()
     }
 }
 
@@ -235,8 +244,44 @@ pub enum Outcome {
     Failed,
 }
 
+/// The spacetimes the renderer can trace through.
+pub enum Spacetime {
+    /// Static, spherically symmetric: planar rays (Schwarzschild, JMN-1).
+    Spherical(Box<dyn SphericalMetric>),
+    /// Rotating black hole, spin along `+z`. The disk always orbits
+    /// counter-clockwise about `+z`, so `a < 0` gives a retrograde disk.
+    Kerr(Kerr),
+}
+
+impl Spacetime {
+    pub fn name(&self) -> String {
+        match self {
+            Spacetime::Spherical(m) => m.name(),
+            Spacetime::Kerr(k) => k.name(),
+        }
+    }
+
+    /// Lapse at the observer, used to convert pixel angles to apparent
+    /// impact parameters (Kerr: monopole part only, `O(a²/r²)` error).
+    pub fn lapse(&self, r: f64) -> f64 {
+        match self {
+            Spacetime::Spherical(m) => m.a(r).sqrt(),
+            Spacetime::Kerr(k) => (1.0 - 2.0 * k.m / r).sqrt(),
+        }
+    }
+
+    /// Natural inner disk edge: Schwarzschild ISCO for spherical metrics,
+    /// the ISCO of the disk's orbital sense for Kerr.
+    pub fn default_disk_inner(&self) -> f64 {
+        match self {
+            Spacetime::Spherical(_) => 6.0,
+            Spacetime::Kerr(k) => k.isco(k.a >= 0.0),
+        }
+    }
+}
+
 pub struct Scene<'a> {
-    pub metric: &'a dyn SphericalMetric,
+    pub spacetime: &'a Spacetime,
     pub camera: Camera,
     pub disk: Option<Disk>,
     pub gas: Option<Gas>,
@@ -252,8 +297,60 @@ struct DiskHit {
 impl Scene<'_> {
     /// Trace one camera ray and return linear RGB radiance.
     pub fn shade(&self, d: Vec3) -> ([f32; 3], Outcome) {
+        match self.spacetime {
+            Spacetime::Spherical(m) => self.shade_spherical(m.as_ref(), d),
+            Spacetime::Kerr(k) => self.shade_kerr(k, d),
+        }
+    }
+
+    /// Kerr: the received photon (travelling along `-d` at the camera) is
+    /// integrated backward in time in Boyer–Lindquist coordinates. The
+    /// camera is a ZAMO. Optically thin gas is not supported here.
+    fn shade_kerr(&self, k: &Kerr, d: Vec3) -> ([f32; 3], Outcome) {
         let cam = &self.camera;
-        let metric = self.metric;
+        let theta0 = cam.pos_hat.z.clamp(-1.0, 1.0).acos();
+        let phi0 = cam.pos_hat.y.atan2(cam.pos_hat.x);
+        let [er, et, ep] = spherical_basis(theta0, phi0);
+        let n = [-d.dot(er), -d.dot(et), -d.dot(ep)];
+        let (y0, l) = kerr::initial_state(k, cam.r_obs, theta0, phi0, n);
+        let e_obs = kerr::zamo_energy(k, l, &y0);
+
+        let on_step = |prev: &KerrState, cur: &KerrState, ds: f64| -> Option<f64> {
+            let disk = self.disk.as_ref()?;
+            let equator = |y: &KerrState| y[1] - 0.5 * PI;
+            if (equator(prev) > 0.0) == (equator(cur) > 0.0) {
+                return None;
+            }
+            let r = kerr::refine_crossing(k, l, -1.0, prev, ds, equator)[0];
+            (r >= disk.r_in && r <= disk.r_out && k.circular_orbit(r).is_some()).then_some(r)
+        };
+
+        let res = kerr::trace(k, y0, l, -1.0, &self.trace, on_step);
+        match res.termination {
+            Termination::Event => {
+                let r = res.event.expect("event termination carries a hit");
+                let (omega, ut) = k.circular_orbit(r).expect("checked at hit");
+                // Real (received) photon: E = 1, p_φ = L.
+                let g = e_obs / (ut * (1.0 - omega * l));
+                (self.disk_color(r, g), Outcome::Disk)
+            }
+            Termination::Escaped => {
+                let y = res.state;
+                let n = kerr::local_direction(k, l, &y);
+                let [er, et, ep] = spherical_basis(y[1], y[2]);
+                // The photon arrived from the opposite of its propagation direction.
+                let dir = -(er * n[0] + et * n[1] + ep * n[2]);
+                (self.sky.sample(dir), Outcome::Sky)
+            }
+            Termination::Captured(_) => ([0.0; 3], Outcome::Horizon),
+            Termination::MaxSteps | Termination::Failed(_) => ([0.0; 3], Outcome::Failed),
+        }
+    }
+
+    /// Static spherical metrics: planar ray, traced forward from the camera
+    /// (equivalent to the received photon by time-reversal symmetry).
+    fn shade_spherical(&self, metric: &dyn SphericalMetric, d: Vec3) -> ([f32; 3], Outcome) {
+        let cam = &self.camera;
 
         // Orbital plane spanned by the radial direction e1 and the ray's
         // tangential part e2. φ is measured from e1 towards e2.
@@ -287,8 +384,8 @@ impl Scene<'_> {
             if !(phi_z > p0 && phi_z <= p1) {
                 return None;
             }
-            let t = (phi_z - p0) / (p1 - p0);
-            let r = prev[0] + t * (cur[0] - prev[0]);
+            let plane_z = |y: &State| y[2].cos() * e1.z + y[2].sin() * e2.z;
+            let r = refine_crossing(metric, l, prev, dl, plane_z)[0];
             if r < disk.r_in || r > disk.r_out || metric.circular_orbit(r).is_none() {
                 return None;
             }
@@ -299,7 +396,10 @@ impl Scene<'_> {
         let (background, outcome) = match res.termination {
             Termination::Event => {
                 let hit = res.event.expect("event termination carries a hit");
-                (self.disk_radiance(hit.r, l, e1.cross(e2)), Outcome::Disk)
+                (
+                    self.disk_radiance(metric, hit.r, l, e1.cross(e2)),
+                    Outcome::Disk,
+                )
             }
             Termination::Escaped => {
                 let psi = escape_angle(metric, l, &res.state);
@@ -320,17 +420,26 @@ impl Scene<'_> {
 
     /// Observed radiance from the disk at radius `r`, including gravitational
     /// and Doppler shift `g = E_obs / E_emit` and bolometric `I ∝ g⁴`.
-    fn disk_radiance(&self, r: f64, l: f64, plane_normal: Vec3) -> [f32; 3] {
-        let disk = self.disk.as_ref().expect("disk radiance without disk");
-        let (omega, ut) = self
-            .metric
+    fn disk_radiance(
+        &self,
+        metric: &dyn SphericalMetric,
+        r: f64,
+        l: f64,
+        plane_normal: Vec3,
+    ) -> [f32; 3] {
+        let (omega, ut) = metric
             .circular_orbit(r)
             .expect("disk hit only where circular orbits exist");
         // The traced ray runs backwards; the physical photon has
         // L_z = -L n̂_z, so E_emit = u^t (1 - Ω L_z) = u^t (1 + Ω L n̂_z).
         let e_emit = ut * (1.0 + omega * l * plane_normal.z);
-        let e_obs = 1.0 / self.metric.a(self.camera.r_obs).sqrt();
-        let g = e_obs / e_emit;
+        let e_obs = 1.0 / metric.a(self.camera.r_obs).sqrt();
+        self.disk_color(r, e_obs / e_emit)
+    }
+
+    /// Disk radiance at radius `r` seen with shift factor `g`.
+    fn disk_color(&self, r: f64, g: f64) -> [f32; 3] {
+        let disk = self.disk.as_ref().expect("disk radiance without disk");
         let flux = disk.flux(r);
         let temperature = g * flux.powf(0.25);
         let intensity = self.disk_brightness * g.powi(4) * flux;
@@ -341,6 +450,18 @@ impl Scene<'_> {
             (c[2] * intensity) as f32,
         ]
     }
+}
+
+/// Orthonormal `(ê_r, ê_θ, ê_φ)` at polar angle `θ`, azimuth `φ` (world frame,
+/// polar axis `+z`).
+fn spherical_basis(theta: f64, phi: f64) -> [Vec3; 3] {
+    let (st, ct) = theta.sin_cos();
+    let (sp, cp) = phi.sin_cos();
+    [
+        Vec3::new(st * cp, st * sp, ct),
+        Vec3::new(ct * cp, ct * sp, -st),
+        Vec3::new(-sp, cp, 0.0),
+    ]
 }
 
 /// Rough blackbody-like color ramp; `t = 1` ≈ hottest disk region at rest.
@@ -376,9 +497,9 @@ mod tests {
     use super::*;
     use horizonlab_core::Schwarzschild;
 
-    fn gas_scene(metric: &dyn SphericalMetric, flow: GasFlow) -> Scene<'_> {
+    fn gas_scene(spacetime: &Spacetime, flow: GasFlow) -> Scene<'_> {
         Scene {
-            metric,
+            spacetime,
             camera: Camera::new(100.0, 90.0, 30.0),
             disk: None,
             gas: Some(Gas {
@@ -402,7 +523,7 @@ mod tests {
     fn gas_column_matches_flat_space_integral() {
         // M → 0: straight rays, g = 1. ∫ dl / r² along a chord of the sphere
         // r < R at impact b is (2/b) atan(√(R² - b²)/b).
-        let metric = Schwarzschild::new(1e-9);
+        let metric = Spacetime::Spherical(Box::new(Schwarzschild::new(1e-9)));
         for flow in [GasFlow::Static, GasFlow::Infall] {
             let scene = gas_scene(&metric, flow);
             for &b in &[2.0, 5.0, 20.0] {
@@ -423,11 +544,96 @@ mod tests {
         // photons travel against the inflow, so E_emit = 1/A + |p_r u^r|
         // exceeds the static value 1/√A at every point. (Escaping rays also
         // cross blueshifted far-side gas, so no such ordering holds there.)
-        let metric = Schwarzschild::new(1.0);
+        let metric = Spacetime::Spherical(Box::new(Schwarzschild::new(1.0)));
         let d = ray_with_impact(&gas_scene(&metric, GasFlow::Static).camera, 3.0);
         let (s, out) = gas_scene(&metric, GasFlow::Static).shade(d);
         let (i, _) = gas_scene(&metric, GasFlow::Infall).shade(d);
         assert_eq!(out, Outcome::Horizon);
         assert!(i[0] < s[0], "infall {} vs static {}", i[0], s[0]);
+    }
+
+    fn disk_scene(spacetime: &Spacetime, r_obs: f64, inclination: f64) -> Scene<'_> {
+        Scene {
+            spacetime,
+            camera: Camera::new(r_obs, inclination, 30.0),
+            disk: Some(Disk::new(6.0, 20.0)),
+            gas: None,
+            sky: Sky::Checker,
+            trace: TraceConfig::default(),
+            disk_brightness: 1.0,
+        }
+    }
+
+    #[test]
+    fn kerr_without_spin_renders_like_schwarzschild() {
+        // End-to-end check of the backward-in-time Kerr path (camera frame,
+        // disk crossing, redshift sign, sky direction) against the planar
+        // forward path.
+        let kerr = Spacetime::Kerr(Kerr::new(1.0, 0.0));
+        let schw = Spacetime::Spherical(Box::new(Schwarzschild::new(1.0)));
+        let (sk, ss) = (disk_scene(&kerr, 40.0, 75.0), disk_scene(&schw, 40.0, 75.0));
+        let mut disk_hits = 0;
+        for i in 0..15 {
+            for j in 0..9 {
+                let d = sk.camera.ray(-0.9 + 0.13 * i as f64, -0.8 + 0.2 * j as f64);
+                let (ck, ok) = sk.shade(d);
+                let (cs, os) = ss.shade(d);
+                assert_eq!(ok, os, "ray ({i},{j})");
+                disk_hits += (ok == Outcome::Disk) as usize;
+                for c in 0..3 {
+                    let tol = 1e-4 * cs[c].abs().max(1e-3);
+                    assert!(
+                        (ck[c] - cs[c]).abs() < tol,
+                        "ray ({i},{j}) ch {c}: {ck:?} vs {cs:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            disk_hits > 10,
+            "test grid should see the disk ({disk_hits})"
+        );
+    }
+
+    #[test]
+    fn kerr_shadow_edges_match_equatorial_photon_orbits() {
+        // Edge-on observer far away: the shadow's horizontal extent along
+        // the equator is set by the prograde and retrograde photon orbits.
+        let k = Kerr::new(1.0, 0.9);
+        let st = Spacetime::Kerr(k);
+        let r_obs = 2000.0;
+        let mut scene = disk_scene(&st, r_obs, 90.0);
+        scene.disk = None;
+        let cam = &scene.camera;
+        let captured = |alpha: f64| {
+            let d = (cam.forward * alpha.cos() + cam.right * alpha.sin()).normalized();
+            scene.shade(d).1 == Outcome::Horizon
+        };
+        let edge = |sign: f64| {
+            let (mut lo, mut hi) = (0.0, sign * 0.01);
+            for _ in 0..40 {
+                let mid = 0.5 * (lo + hi);
+                if captured(mid) {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            r_obs * lo.abs().sin() / (1.0 - 2.0 / r_obs).sqrt()
+        };
+        let (left, right) = (edge(-1.0), edge(1.0));
+        let (pro, retro) = (
+            k.equatorial_critical_impact(true),
+            k.equatorial_critical_impact(false),
+        );
+        let (small, large) = (left.min(right), left.max(right));
+        assert!(
+            (small - pro).abs() / pro < 3e-3,
+            "prograde edge {small} vs {pro}"
+        );
+        assert!(
+            (large - retro).abs() / retro < 3e-3,
+            "retrograde edge {large} vs {retro}"
+        );
     }
 }

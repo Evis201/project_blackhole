@@ -175,6 +175,31 @@ impl Dopri5 {
             }
         }
     }
+
+    /// Locate a sign change of `g` inside an accepted step of size `h` from
+    /// `y0`, by bisecting on the sub-step length (each trial is one RK step
+    /// from `y0`, so the located state is 5th-order accurate). Returns the
+    /// state at the crossing.
+    pub fn bisect_event<const N: usize, F, G>(&self, f: &F, y0: &[f64; N], h: f64, g: G) -> [f64; N]
+    where
+        F: Fn(&[f64; N]) -> [f64; N],
+        G: Fn(&[f64; N]) -> f64,
+    {
+        let g0 = g(y0);
+        let (mut lo, mut hi) = (0.0, h);
+        let mut y_hi = self.step(f, y0, h).0;
+        for _ in 0..48 {
+            let mid = 0.5 * (lo + hi);
+            let y_mid = self.step(f, y0, mid).0;
+            if (g(&y_mid) > 0.0) == (g0 > 0.0) {
+                lo = mid;
+            } else {
+                hi = mid;
+                y_hi = y_mid;
+            }
+        }
+        y_hi
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +221,18 @@ mod tests {
         };
         let ratio = run(10) / run(20);
         assert!(ratio > 25.0 && ratio < 40.0, "convergence ratio {ratio}");
+    }
+
+    #[test]
+    fn bisect_event_finds_zero_crossing() {
+        // Oscillator x = cos t, stepping h = 0.05 from t = 1.55 (a step size
+        // the controller accepts at default tolerance): crossing at t = π/2.
+        let solver = Dopri5::default();
+        let f = |y: &[f64; 2]| [y[1], -y[0]];
+        let y0 = [1.55f64.cos(), -1.55f64.sin()];
+        let y = solver.bisect_event(&f, &y0, 0.05, |y| y[0]);
+        assert!(y[0].abs() < 1e-12, "x = {}", y[0]);
+        assert!((y[1] + 1.0).abs() < 1e-12, "v = {}", y[1]);
     }
 
     #[test]

@@ -14,16 +14,17 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use horizonlab_core::{Jmn1, Schwarzschild, SphericalMetric, Tolerance, TraceConfig};
+use horizonlab_core::{Jmn1, Kerr, Schwarzschild, Tolerance, TraceConfig};
 use rayon::prelude::*;
 
 use observe::{gaussian_blur, luminance, radial_profile, Source};
-use scene::{Camera, Disk, Gas, GasFlow, Outcome, Scene, Sky};
+use scene::{Camera, Disk, Gas, GasFlow, Outcome, Scene, Sky, Spacetime};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum MetricKind {
     Schwarzschild,
     Jmn1,
+    Kerr,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -46,6 +47,9 @@ struct Args {
     /// JMN-1 boundary radius R_b (> 2M). R_b < 3M ⇒ photon sphere exists.
     #[arg(long, default_value_t = 2.5)]
     rb: f64,
+    /// Kerr spin a/M, |a| < 1. Negative = disk retrograde to the spin.
+    #[arg(long, default_value_t = 0.9, allow_negative_numbers = true)]
+    spin: f64,
 
     /// Also render this metric with identical settings and write a
     /// side-by-side comparison with a residual map: [main | vs | main − vs].
@@ -54,6 +58,9 @@ struct Args {
     /// R_b for the `--vs` metric when it is JMN-1.
     #[arg(long, default_value_t = 4.0)]
     vs_rb: f64,
+    /// Spin for the `--vs` metric when it is Kerr.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    vs_spin: f64,
 
     #[arg(long, default_value_t = 800)]
     width: u32,
@@ -72,8 +79,9 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     samples: u32,
 
-    #[arg(long, default_value_t = 6.0)]
-    disk_in: f64,
+    /// Inner disk radius (default: ISCO — 6M, or the Kerr ISCO).
+    #[arg(long)]
+    disk_in: Option<f64>,
     #[arg(long, default_value_t = 20.0)]
     disk_out: f64,
     #[arg(long)]
@@ -123,17 +131,26 @@ struct Args {
 }
 
 impl Args {
-    fn build_metric(&self, kind: MetricKind, rb: f64) -> Box<dyn SphericalMetric> {
+    fn build_spacetime(&self, kind: MetricKind, rb: f64, spin: f64) -> Spacetime {
         match kind {
-            MetricKind::Schwarzschild => Box::new(Schwarzschild::new(self.mass)),
-            MetricKind::Jmn1 => Box::new(Jmn1::new(self.mass, rb)),
+            MetricKind::Schwarzschild => {
+                Spacetime::Spherical(Box::new(Schwarzschild::new(self.mass)))
+            }
+            MetricKind::Jmn1 => Spacetime::Spherical(Box::new(Jmn1::new(self.mass, rb))),
+            MetricKind::Kerr => Spacetime::Kerr(Kerr::new(self.mass, spin * self.mass)),
         }
     }
 
     fn build_scene<'a>(
         &self,
-        metric: &'a dyn SphericalMetric,
-    ) -> Result<Scene<'a>, image::ImageError> {
+        spacetime: &'a Spacetime,
+    ) -> Result<Scene<'a>, Box<dyn std::error::Error>> {
+        if matches!(spacetime, Spacetime::Kerr(_)) && !matches!(self.gas, GasKind::None) {
+            return Err("--gas is only implemented for spherical metrics, not Kerr".into());
+        }
+        let disk_in = self
+            .disk_in
+            .unwrap_or_else(|| spacetime.default_disk_inner());
         let sky = match &self.sky_image {
             Some(path) => Sky::load(path)?,
             None if self.black_sky => Sky::Black,
@@ -145,9 +162,9 @@ impl Args {
             GasKind::Infall => Some(GasFlow::Infall),
         };
         Ok(Scene {
-            metric,
+            spacetime,
             camera: Camera::new(self.distance, self.inclination, self.fov),
-            disk: (!self.no_disk).then(|| Disk::new(self.disk_in, self.disk_out)),
+            disk: (!self.no_disk).then(|| Disk::new(disk_in, self.disk_out)),
             gas: flow.map(|flow| Gas {
                 flow,
                 r_out: self.gas_out,
@@ -247,8 +264,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.samples.max(1) as usize,
     );
 
-    let metric = args.build_metric(args.metric, args.rb);
-    let scene = args.build_scene(metric.as_ref())?;
+    let metric = args.build_spacetime(args.metric, args.rb, args.spin);
+    let scene = args.build_scene(&metric)?;
     println!(
         "Rendering {} at {w}x{h} ({s}x{s} spp), r_obs={}M, i={}°",
         metric.name(),
@@ -261,8 +278,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut vs = match args.vs {
         Some(kind) => {
-            let vs_metric = args.build_metric(kind, args.vs_rb);
-            let vs_scene = args.build_scene(vs_metric.as_ref())?;
+            let vs_metric = args.build_spacetime(kind, args.vs_rb, args.vs_spin);
+            let vs_scene = args.build_scene(&vs_metric)?;
             println!("Rendering {} for comparison", vs_metric.name());
             let vs_frame = render(&vs_scene, w, h, s);
             print_stats(&vs_metric.name(), &vs_frame);
@@ -272,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Image-plane scale: apparent impact parameter b = r sin α / √A(r).
-    let px_scale = scene.camera.pixel_angle(h) * args.distance / metric.a(args.distance).sqrt();
+    let px_scale = scene.camera.pixel_angle(h) * args.distance / metric.lapse(args.distance);
     if let Some(fwhm_uas) = args.blur_fwhm {
         let theta_g = args.source.theta_g_uas();
         let sigma_px = fwhm_uas / theta_g / px_scale / (8.0 * 2f64.ln()).sqrt();

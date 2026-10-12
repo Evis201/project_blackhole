@@ -140,7 +140,8 @@ mod tests {
             .flat_map(|y| (0..w).map(move |x| (x, y)))
             .map(|(x, y)| (x as f64 - 50.0).powi(2) * img[y * w + x][0] as f64)
             .sum();
-        assert!((var - sigma * sigma).abs() < 1e-3, "variance {var}");
+        // Truncating the kernel at 4σ drops the tails: relative bias ≈ 5e-4.
+        assert!((var / (sigma * sigma) - 1.0).abs() < 1e-3, "variance {var}");
     }
 
     #[test]

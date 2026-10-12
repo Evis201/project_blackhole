@@ -122,9 +122,9 @@ pub enum Termination {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TraceResult<T> {
+pub struct TraceResult<T, S = State> {
     pub termination: Termination,
-    pub state: State,
+    pub state: S,
     pub event: Option<T>,
     pub steps: usize,
     /// Largest `|H|` seen at accepted steps.
@@ -214,4 +214,16 @@ where
         cfg.max_steps,
         max_constraint,
     )
+}
+
+/// State where `g` changes sign inside the accepted step `prev → +dλ`
+/// (as reported to `on_step`). Use for exact event positions, e.g. disk
+/// crossings, instead of interpolating between step endpoints.
+pub fn refine_crossing<M, G>(metric: &M, l: f64, prev: &State, dl: f64, g: G) -> State
+where
+    M: SphericalMetric + ?Sized,
+    G: Fn(&State) -> f64,
+{
+    let f = |y: &State| rhs(metric, l, y);
+    Dopri5::default().bisect_event(&f, prev, dl, g)
 }

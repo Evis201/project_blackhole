@@ -2,15 +2,16 @@
 
 Ray tracer for comparing black holes with horizonless black-hole mimickers.
 
-Current state (MVP): double-precision CPU reference renderer for
-**Schwarzschild** and **JMN-1** (Joshi–Malafarina–Narayan naked singularity),
-with a thin accretion disk and a lensed background sky.
+Current state: double-precision CPU reference renderer for
+**Schwarzschild**, **Kerr** and **JMN-1** (Joshi–Malafarina–Narayan naked
+singularity), with a thin accretion disk, optically thin gas, a lensed
+background sky, comparison maps and telescope-resolution blurring.
 
 ## Layout
 
 | Crate | Purpose |
 |---|---|
-| `crates/horizonlab-core` | Metrics, Dormand–Prince 5(4) integrator, planar null geodesics. No dependencies. |
+| `crates/horizonlab-core` | Metrics, Dormand–Prince 5(4) integrator with event location, planar null geodesics (spherical), Boyer–Lindquist geodesics (Kerr). No dependencies. |
 | `crates/horizonlab-render` | `horizonlab` CLI: camera, disk, sky, PNG output (rayon-parallel). |
 
 ## Quick start
@@ -19,6 +20,7 @@ with a thin accretion disk and a lensed background sky.
 cargo test --workspace
 cargo run --release -- --metric schwarzschild --distance 100 --fov 22 --inclination 82 -o schw.png
 cargo run --release -- --metric jmn1 --rb 4   --distance 100 --fov 22 --inclination 82 -o jmn1.png
+cargo run --release -- --metric kerr --spin 0.99 --distance 100 --fov 22 --inclination 82 -o kerr.png
 cargo run --release -- --help
 
 # Side-by-side comparison with residual map: [main | vs | main − vs]
@@ -43,7 +45,8 @@ All lengths are in units of the mass `M` (G = c = 1).
 
 ### Metrics
 
-Both are static and spherically symmetric, `ds² = -A(r) dt² + B(r) dr² + r² dΩ²`.
+Schwarzschild and JMN-1 are static and spherically symmetric,
+`ds² = -A(r) dt² + B(r) dr² + r² dΩ²`. Kerr is described below.
 
 | Metric | A(r) | B(r) | Absorber |
 |---|---|---|---|
@@ -63,8 +66,35 @@ polar coordinate singularity and makes the system 3-dimensional. `|H|` is
 tracked as an accuracy check.
 
 Integrator: adaptive Dormand–Prince 5(4), default `rtol = 1e-8` in the
-renderer. Steps are capped at `0.05 r` so that disk crossings can be
-interpolated between steps.
+renderer. Steps are capped at `0.05 r` (affine length). Disk crossings are
+located exactly: bisection on the sub-step length inside the accepted step,
+each trial being one RK step (`Dopri5::bisect_event`). Linear interpolation
+between step endpoints gave errors of order 1e-3 in disk brightness.
+
+### Kerr
+
+Boyer–Lindquist coordinates, spin along `+z`. Rays are integrated in Mino
+time `σ` (`dλ = Σ dσ`) with the separable super-Hamiltonian, `E = 1`, `L = p_φ`:
+
+```text
+𝓗 = ½ ( Δ p_r² + p_θ² - P²/Δ + (L/sinθ - a sinθ)² ),   P = r² + a² - aL
+```
+
+The state is `(r, θ, φ, p_r, p_θ)`. Mino time removes the `Σ` factors.
+
+- **Camera:** a zero-angular-momentum observer (ZAMO). A pixel's direction
+  `d` maps to a *received* photon moving along `-d` in the ZAMO frame.
+- **Backward tracing:** Kerr is only symmetric under `t → -t, φ → -φ`
+  together, so the static-metric trick of tracing forward from the camera is
+  invalid here. The photon is integrated **backward in time**
+  (`kerr::trace(.., time_sign = -1, ..)`).
+- **Disk:** prograde equatorial circular geodesics,
+  `Ω = √M / (r^{3/2} + a√M)` (Bardeen et al. 1972). The shift factor is
+  `g = E_ZAMO,cam / (u^t (1 - Ω L))`. The disk always orbits
+  counter-clockwise about `+z`, so `--spin` < 0 gives a retrograde disk. The
+  default inner edge is the matching ISCO.
+- **Not supported:** optically thin gas in Kerr. The command refuses
+  `--gas` with `--metric kerr`.
 
 ### Disk
 
@@ -72,7 +102,10 @@ The disk is thin and opaque, in the `z = 0` plane, on prograde circular
 geodesics with `Ω² = A'/(2r)`. The shift factor
 `g = E_obs/E_emit` includes the gravitational and Doppler terms, and observed
 intensity scales as `g⁴ F(r)`. The flux profile `F(r)` is the Newtonian
-thin-disk form, used as a placeholder.
+thin-disk form, used as a placeholder. Its normalization is absolute: `F = 1`
+at the peak of a disk with `r_in = 6M`, the same accretion rate for every
+disk. A disk reaching further in (Kerr ISCO) is therefore brighter, and
+images of different spacetimes can be compared directly.
 
 ### Optically thin gas
 
@@ -145,6 +178,18 @@ makes up the JMN-1 object.
    distinguished from Schwarzschild by its image alone, unless the plasma
    model is known independently.
 
+5. **Kerr: spin shapes the image far more than the mimicker does.** With the
+   same disk and accretion rate (r_obs = 100M, i = 82°):
+   - a = 0.99 prograde: the disk reaches the ISCO at 1.45M and dominates
+     (luminance residual up to ~157, against an r_in = 6M disk peaking near
+     1 at the same exposure). The shadow is smaller,
+     flattened on the approaching side, and shifted.
+   - a = −0.99 (retrograde disk): the ISCO is at 8.97M, leaving a wide gap
+     between the disk and a larger shadow.
+   - Edge-on, the horizontal extent of the shadow matches the analytic
+     equatorial photon orbits (a = 0.9: b = 2.85M prograde, 6.83M retrograde)
+     to < 0.3%.
+
 ## Validation (`cargo test`)
 
 | Test | Reference |
@@ -163,13 +208,24 @@ makes up the JMN-1 object.
 | θ_g | M87* 3.82 μas, Sgr A* 4.84 μas (published EHT values) |
 | Gaussian beam | Flux conserved; point-source variance = σ² (4σ cutoff bias 5e-4) |
 | Radial profile | Uniform image → flat profile |
+| Event location | Oscillator zero crossing located to 1e-12 within one step |
+| Kerr ISCO | a = 0: 6M; a = 0.9: 2.3209M / 8.7174M (Bardeen et al. 1972) |
+| Kerr photon orbits | a = 0: 3√3 M; a → 1: 2M prograde, 7M retrograde |
+| Kerr initial state | `H = 0` and direction round-trip for arbitrary ZAMO directions |
+| Kerr a = 0, tilted planes | Deflection = planar Schwarzschild for b = 6, 10, 50M; plane tilts 0, 0.7, 1.4 rad (< 1e-8) |
+| Kerr a = 0.9 capture | Equatorial b_c(1 ∓ 1e-4) → captured / escapes, prograde and retrograde |
+| Kerr backward tracing | Forward then backward integration returns to start (< 1e-4) |
+| Kerr a = 0 render | Same outcome and disk/sky color as the Schwarzschild path, 135 rays, < 1e-4 relative |
+| Kerr a = 0.9 shadow | Edge-on shadow extent = analytic photon orbits (< 0.3%) |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 
 ## Known limitations
 
-- No Kerr yet: it needs a full 4D Hamiltonian path, because orbits are not planar.
+- No optically thin gas for Kerr (spherical metrics only). The Kerr camera
+  is a ZAMO and the spherical camera is a static observer; they agree as
+  `r_obs → ∞`.
 - Rays reaching `r < 10⁻⁴ M` in JMN-1 count as absorbed by the singularity.
   The physics of the singularity is not modeled.
 - Disk flux profile is Newtonian, and stability of circular orbits is not
@@ -185,7 +241,9 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 1. ~~Difference-map mode~~ (`--vs`) ✓
 2. ~~Optically thin emission~~ (`--gas static|infall`) ✓
 3. ~~EHT/ngEHT blur and radial profiles~~ (`--blur-fwhm`, `--profile`) ✓
-4. Kerr (4D Hamiltonian, Boyer–Lindquist).
+4. ~~Kerr~~ (`--metric kerr --spin a`) ✓
+4b. Novikov–Thorne disk flux (relativistic, per metric) in place of the
+    Newtonian profile; gas for Kerr.
 5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
 6. Interior views (tidal tensor along infalling geodesics; Kasner regime).
 7. Interferometric observables (visibility amplitudes on real EHT baselines)
