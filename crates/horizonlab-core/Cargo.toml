@@ -1,0 +1,8 @@
+[package]
+name = "horizonlab-core"
+description = "Spacetime metrics and null-geodesic integration for HorizonLab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
