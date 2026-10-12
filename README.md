@@ -101,11 +101,31 @@ The state is `(r, θ, φ, p_r, p_θ)`. Mino time removes the `Σ` factors.
 The disk is thin and opaque, in the `z = 0` plane, on prograde circular
 geodesics with `Ω² = A'/(2r)`. The shift factor
 `g = E_obs/E_emit` includes the gravitational and Doppler terms, and observed
-intensity scales as `g⁴ F(r)`. The flux profile `F(r)` is the Newtonian
-thin-disk form, used as a placeholder. Its normalization is absolute: `F = 1`
-at the peak of a disk with `r_in = 6M`, the same accretion rate for every
-disk. A disk reaching further in (Kerr ISCO) is therefore brighter, and
-images of different spacetimes can be compared directly.
+intensity scales as `g⁴ F(r)`.
+
+Flux `F(r)` (`--disk-model`):
+
+- **`novikov-thorne`** (default): relativistic thin disk, computed for the
+  actual spacetime (Page & Thorne 1974):
+
+  ```text
+  F(r) = - Ω' / (4π √(-g) (E - ΩL)²) · ∫_{r_in}^{r} (E - ΩL) L' dr
+  ```
+
+  `E, L, Ω` come from the circular orbits of the metric. For static
+  spherical metrics, `E = A u^t` and `L = r²Ω u^t`; for Kerr they are the
+  Bardeen–Press–Teukolsky formulas. The torque vanishes at `r_in`, so the
+  flux does too. The flux is tabulated on a log grid (4000 points) and the
+  radiative efficiency `1 - E(r_in)` is printed. Where `L' < 0` (unstable
+  orbits) the flux is clamped at 0.
+- **`newtonian`**: `F ∝ r⁻³(1 - √(r_in/r))`, independent of the metric.
+
+The normalization is absolute: `F = 1` at the peak of a Schwarzschild disk
+with `r_in = 6M` under the same model, i.e. the same accretion rate for
+every disk. A disk reaching further in (Kerr ISCO, JMN-1 interior) is
+therefore brighter and hotter, and images of different spacetimes can be
+compared directly. Lower `--exposure` for high-spin images, which
+saturate.
 
 ### Optically thin gas
 
@@ -190,6 +210,23 @@ makes up the JMN-1 object.
      equatorial photon orbits (a = 0.9: b = 2.85M prograde, 6.83M retrograde)
      to < 0.3%.
 
+6. **Radiative efficiency `1 - E(r_in)`** of the Novikov–Thorne disk:
+
+   | Spacetime | r_in | η |
+   |---|---|---|
+   | Schwarzschild | 6M | 5.72% |
+   | Kerr a = 0.5 | 4.233M | 8.21% |
+   | Kerr a = 0.9 | 2.321M | 15.58% |
+   | Kerr a = 0.99 | 1.454M | 26.40% |
+   | Kerr a = −0.99 (retrograde) | 8.972M | 3.79% |
+   | JMN-1, R_b = 4M | 0.5M | 64.6% |
+
+   JMN-1 without a photon sphere has circular orbits deep in its interior,
+   so a disk there can exceed the efficiency of any Kerr black hole. Joshi,
+   Malafarina & Narayan (2014) report these orbits to be stable for
+   `M₀ < 2/3`; that is not checked here beyond `F ≥ 0` along this disk. This
+   is an observable different in kind from shadow imaging.
+
 ## Validation (`cargo test`)
 
 | Test | Reference |
@@ -217,6 +254,9 @@ makes up the JMN-1 object.
 | Kerr backward tracing | Forward then backward integration returns to start (< 1e-4) |
 | Kerr a = 0 render | Same outcome and disk/sky color as the Schwarzschild path, 135 rays, < 1e-4 relative |
 | Kerr a = 0.9 shadow | Edge-on shadow extent = analytic photon orbits (< 0.3%) |
+| Novikov–Thorne energy | `∫4π√(-g) E F dr = 1 - E(r_in)`: Schwarzschild error 2.8e-5 (matches truncation at 10⁶M), Kerr a = 0.9 error 1.3e-5 |
+| Novikov–Thorne, two paths | Kerr a = 0 vs spherical adapter: flux agrees < 1e-6; rendered disk < 1e-4 |
+| Novikov–Thorne limits | F(r_in) = 0; F → 3/(8πr³) far out |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
@@ -228,8 +268,10 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
   `r_obs → ∞`.
 - Rays reaching `r < 10⁻⁴ M` in JMN-1 count as absorbed by the singularity.
   The physics of the singularity is not modeled.
-- Disk flux profile is Newtonian, and stability of circular orbits is not
-  checked (only that they exist).
+- Stability of circular orbits is not checked directly. Novikov–Thorne
+  clamps the flux to 0 where `L' < 0`. The disk is opaque and emits as a
+  colored ramp with intensity `g⁴F`; there is no blackbody spectrum or limb
+  darkening.
 - Escape direction is read at `r_escape = max(10 r_obs, 1000M)`, leaving
   `O(M/r_escape)` residual bending.
 - The beam is an image-plane Gaussian, not real interferometric sampling
@@ -242,8 +284,7 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 2. ~~Optically thin emission~~ (`--gas static|infall`) ✓
 3. ~~EHT/ngEHT blur and radial profiles~~ (`--blur-fwhm`, `--profile`) ✓
 4. ~~Kerr~~ (`--metric kerr --spin a`) ✓
-4b. Novikov–Thorne disk flux (relativistic, per metric) in place of the
-    Newtonian profile; gas for Kerr.
+4b. ~~Novikov–Thorne disk flux~~ (`--disk-model`) ✓ — next: gas for Kerr.
 5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
 6. Interior views (tidal tensor along infalling geodesics; Kasner regime).
 7. Interferometric observables (visibility amplitudes on real EHT baselines)

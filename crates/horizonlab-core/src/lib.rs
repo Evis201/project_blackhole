@@ -16,11 +16,13 @@
 //! Kerr ([`kerr`]) has no such reduction: rays are integrated in full
 //! Boyer–Lindquist coordinates `(r, θ, φ, p_r, p_θ)` in Mino time.
 
+pub mod disk;
 pub mod geodesic;
 pub mod integrator;
 pub mod kerr;
 pub mod metric;
 
+pub use disk::{EquatorialOrbits, NovikovThorne, SphericalOrbits};
 pub use geodesic::{
     escape_angle, hamiltonian, initial_state, local_direction, refine_crossing, trace, State,
     Termination, TraceConfig, TraceResult,

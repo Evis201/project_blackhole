@@ -28,6 +28,14 @@ enum MetricKind {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum DiskModel {
+    /// Relativistic Novikov–Thorne flux for the chosen spacetime.
+    NovikovThorne,
+    /// Metric-independent r⁻³(1 - √(r_in/r)) profile.
+    Newtonian,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum GasKind {
     None,
     Static,
@@ -86,6 +94,9 @@ struct Args {
     disk_out: f64,
     #[arg(long)]
     no_disk: bool,
+    /// Disk emission model.
+    #[arg(long, value_enum, default_value = "novikov-thorne")]
+    disk_model: DiskModel,
     /// Disk brightness multiplier.
     #[arg(long, default_value_t = 1.5)]
     exposure: f64,
@@ -151,6 +162,21 @@ impl Args {
         let disk_in = self
             .disk_in
             .unwrap_or_else(|| spacetime.default_disk_inner());
+        let disk = match (self.no_disk, self.disk_model) {
+            (true, _) => None,
+            (false, DiskModel::Newtonian) => Some(Disk::newtonian(disk_in, self.disk_out)),
+            (false, DiskModel::NovikovThorne) => {
+                let disk = Disk::novikov_thorne(spacetime, disk_in, self.disk_out)?;
+                if let Some(eta) = disk.efficiency() {
+                    println!(
+                        "  {} disk: r_in = {disk_in:.4}M, radiative efficiency {:.2}%",
+                        spacetime.name(),
+                        100.0 * eta
+                    );
+                }
+                Some(disk)
+            }
+        };
         let sky = match &self.sky_image {
             Some(path) => Sky::load(path)?,
             None if self.black_sky => Sky::Black,
@@ -164,7 +190,7 @@ impl Args {
         Ok(Scene {
             spacetime,
             camera: Camera::new(self.distance, self.inclination, self.fov),
-            disk: (!self.no_disk).then(|| Disk::new(disk_in, self.disk_out)),
+            disk,
             gas: flow.map(|flow| Gas {
                 flow,
                 r_out: self.gas_out,

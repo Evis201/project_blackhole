@@ -2,12 +2,14 @@
 
 use std::f64::consts::PI;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use horizonlab_core::kerr::{self, Kerr, KerrState};
 use horizonlab_core::{
     escape_angle, initial_state, refine_crossing, trace, Capture, SphericalMetric, State,
     Termination, TraceConfig,
 };
+use horizonlab_core::{NovikovThorne, Schwarzschild, SphericalOrbits};
 
 use crate::vec3::Vec3;
 
@@ -56,35 +58,85 @@ impl Camera {
 }
 
 /// Geometrically thin, optically thick disk in the `z = 0` plane on
-/// circular geodesics (prograde about `+z`).
+/// circular geodesics (counter-clockwise about `+z`).
 ///
-/// Emission uses the Newtonian thin-disk flux profile
-/// `F(r) ∝ r⁻³ (1 - √(r_in/r))` — a placeholder for Novikov–Thorne, which
-/// needs metric-specific orbital quantities.
-///
-/// The normalisation is absolute (same accretion rate for every disk):
-/// `F = 1` at the peak of a disk with `r_in = 6M`. Disks reaching closer in
-/// (Kerr ISCO, JMN-1 interior) are correspondingly brighter and hotter, so
-/// images of different spacetimes are directly comparable.
+/// The flux normalisation is absolute (same accretion rate for every disk):
+/// `F = 1` at the peak of a Schwarzschild disk with `r_in = 6M` under the
+/// same flux model. Disks reaching closer in (Kerr ISCO, JMN-1 interior) are
+/// correspondingly brighter and hotter, so images of different spacetimes
+/// are directly comparable.
 pub struct Disk {
     pub r_in: f64,
     pub r_out: f64,
+    model: FluxModel,
+}
+
+enum FluxModel {
+    /// `F ∝ r⁻³ (1 - √(r_in/r))`: metric-independent placeholder.
+    Newtonian,
+    /// Relativistic Novikov–Thorne flux for the actual spacetime.
+    NovikovThorne(NovikovThorne),
 }
 
 /// Peak of `r⁻³(1 - √(6/r))`, reached at `r = (49/36)·6`.
-fn reference_flux_peak() -> f64 {
+fn newtonian_reference_peak() -> f64 {
     let r: f64 = 49.0 / 36.0 * 6.0;
     r.powi(-3) * (1.0 - (6.0 / r).sqrt())
 }
 
+/// Peak Novikov–Thorne flux of a Schwarzschild disk from `r_in = 6M`.
+fn novikov_thorne_reference_peak() -> f64 {
+    static PEAK: OnceLock<f64> = OnceLock::new();
+    *PEAK.get_or_init(|| {
+        let s = Schwarzschild::new(1.0);
+        NovikovThorne::new(&SphericalOrbits(&s), 6.0, 100.0)
+            .expect("Schwarzschild ISCO has a circular orbit")
+            .peak()
+    })
+}
+
 impl Disk {
-    pub fn new(r_in: f64, r_out: f64) -> Self {
+    /// Newtonian flux profile (metric-independent).
+    pub fn newtonian(r_in: f64, r_out: f64) -> Self {
         assert!(r_in > 0.0 && r_out > r_in, "need 0 < r_in < r_out");
-        Self { r_in, r_out }
+        Self {
+            r_in,
+            r_out,
+            model: FluxModel::Newtonian,
+        }
+    }
+
+    /// Novikov–Thorne flux computed for `spacetime`. Fails if there is no
+    /// circular orbit at `r_in` (e.g. inside the photon orbit).
+    pub fn novikov_thorne(spacetime: &Spacetime, r_in: f64, r_out: f64) -> Result<Self, String> {
+        let nt = match spacetime {
+            Spacetime::Spherical(m) => {
+                NovikovThorne::new(&SphericalOrbits(m.as_ref()), r_in, r_out)
+            }
+            Spacetime::Kerr(k) => NovikovThorne::new(k, r_in, r_out),
+        }?;
+        Ok(Self {
+            r_in,
+            r_out,
+            model: FluxModel::NovikovThorne(nt),
+        })
+    }
+
+    /// Radiative efficiency `1 - E(r_in)` (Novikov–Thorne only).
+    pub fn efficiency(&self) -> Option<f64> {
+        match &self.model {
+            FluxModel::Newtonian => None,
+            FluxModel::NovikovThorne(nt) => Some(nt.efficiency()),
+        }
     }
 
     fn flux(&self, r: f64) -> f64 {
-        (r.powi(-3) * (1.0 - (self.r_in / r).sqrt())).max(0.0) / reference_flux_peak()
+        match &self.model {
+            FluxModel::Newtonian => {
+                (r.powi(-3) * (1.0 - (self.r_in / r).sqrt())).max(0.0) / newtonian_reference_peak()
+            }
+            FluxModel::NovikovThorne(nt) => nt.flux(r) / novikov_thorne_reference_peak(),
+        }
     }
 }
 
@@ -495,7 +547,6 @@ fn thermal_ramp(t: f64) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use horizonlab_core::Schwarzschild;
 
     fn gas_scene(spacetime: &Spacetime, flow: GasFlow) -> Scene<'_> {
         Scene {
@@ -556,7 +607,7 @@ mod tests {
         Scene {
             spacetime,
             camera: Camera::new(r_obs, inclination, 30.0),
-            disk: Some(Disk::new(6.0, 20.0)),
+            disk: Some(Disk::newtonian(6.0, 20.0)),
             gas: None,
             sky: Sky::Checker,
             trace: TraceConfig::default(),
@@ -571,7 +622,18 @@ mod tests {
         // forward path.
         let kerr = Spacetime::Kerr(Kerr::new(1.0, 0.0));
         let schw = Spacetime::Spherical(Box::new(Schwarzschild::new(1.0)));
-        let (sk, ss) = (disk_scene(&kerr, 40.0, 75.0), disk_scene(&schw, 40.0, 75.0));
+        let (mut sk, mut ss) = (disk_scene(&kerr, 40.0, 75.0), disk_scene(&schw, 40.0, 75.0));
+        for novikov_thorne in [false, true] {
+            if novikov_thorne {
+                // Independent orbit formulas: Kerr (BPT 1972) vs spherical adapter.
+                sk.disk = Some(Disk::novikov_thorne(&kerr, 6.0, 20.0).unwrap());
+                ss.disk = Some(Disk::novikov_thorne(&schw, 6.0, 20.0).unwrap());
+            }
+            compare_renders(&sk, &ss);
+        }
+    }
+
+    fn compare_renders(sk: &Scene, ss: &Scene) {
         let mut disk_hits = 0;
         for i in 0..15 {
             for j in 0..9 {
