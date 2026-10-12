@@ -2,17 +2,27 @@
 
 Ray tracer for comparing black holes with horizonless black-hole mimickers.
 
-Current state: double-precision CPU reference renderer for
-**Schwarzschild**, **Kerr** and **JMN-1** (Joshi–Malafarina–Narayan naked
-singularity), with a thin accretion disk, optically thin gas, a lensed
-background sky, comparison maps and telescope-resolution blurring.
+Features:
+
+- **Spacetimes:** **Schwarzschild**, **Kerr** and **JMN-1**
+  (Joshi–Malafarina–Narayan naked singularity).
+- **CPU reference renderer** (double precision): Novikov–Thorne thin disk,
+  optically thin gas, lensed sky, comparison maps.
+- **Observables:** telescope-resolution blurring, radial profiles and
+  interferometric visibility amplitudes.
+- **Interior:** tidal forces along radial infall.
+- **Interactive GPU viewer** (wgpu) for the static spacetimes.
+
+The physics, validation and results are written up in
+[`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## Layout
 
 | Crate | Purpose |
 |---|---|
 | `crates/horizonlab-core` | Metrics, Dormand–Prince 5(4) integrator with event location, planar null geodesics (spherical), Boyer–Lindquist geodesics (Kerr). No dependencies. |
-| `crates/horizonlab-render` | `horizonlab` CLI: camera, disk, sky, PNG output (rayon-parallel). `horizonlab-infall` CLI: tidal forces along radial free fall. |
+| `crates/horizonlab-render` | `horizonlab` CLI: camera, disk, gas, sky, comparison, blur, profiles, visibilities (rayon-parallel). `horizonlab-infall` CLI: tidal forces along radial free fall. |
+| `crates/horizonlab-gpu` | `horizonlab-view`: interactive wgpu viewer (Schwarzschild, JMN-1), single precision, checked against the CPU renderer with `--compare`. |
 
 ## Quick start
 
@@ -38,6 +48,21 @@ cargo run --release -- --distance 1000 --fov 2.864 --width 300 --height 300 \
     --metric schwarzschild --vs jmn1 --vs-rb 2.95 --no-disk --black-sky --gas static \
     --blur-fwhm 20 --source m87 --profile profile.csv -o obs.png
 ```
+
+```sh
+# Interferometric visibility amplitudes |V|/V0 vs baseline (unblurred image)
+cargo run --release -- --distance 1000 --fov 2.864 --width 200 --height 200 --no-disk     --black-sky --gas infall --gas-out 20 --metric kerr --spin 0.9 --vs schwarzschild     --visibilities vis.csv -o vis.png
+
+# Interactive GPU viewer; headless check against a CPU render with the same flags
+cargo run --release --bin horizonlab-view -- --metric jmn1 --rb 2.5
+cargo run --release -- --metric jmn1 --rb 2.5 --width 640 --height 360 -o cpu.png
+cargo run --release --bin horizonlab-view -- --metric jmn1 --rb 2.5 --width 640 --height 360     --headless gpu.png --compare cpu.png
+```
+
+Viewer controls: left-drag to orbit, wheel to zoom, `M` switches metric,
+`↑`/`↓` change R_b, `D` toggles the disk, `N` switches between
+Novikov–Thorne and Newtonian flux, `+`/`-` set exposure, `[` `]` set field
+of view, `Esc` quits. A frame is re-traced only when something changes.
 
 ```sh
 # Radial free fall: proper time, tidal forces, curvature (CSV optional)
@@ -99,8 +124,12 @@ The state is `(r, θ, φ, p_r, p_θ)`. Mino time removes the `Σ` factors.
   `g = E_ZAMO,cam / (u^t (1 - Ω L))`. The disk always orbits
   counter-clockwise about `+z`, so `--spin` < 0 gives a retrograde disk. The
   default inner edge is the matching ISCO.
-- **Not supported:** optically thin gas in Kerr. The command refuses
-  `--gas` with `--metric kerr`.
+- **Gas in Kerr:** `--gas static` means ZAMO gas, since static observers do
+  not exist inside the ergoregion; it is identical to static gas at a = 0.
+  `--gas infall` is geodesic free fall from rest at infinity with
+  `L = Q = 0`: `Σu^t = (r²+a²)²/Δ - a²sin²θ`, `Σu^r = -√(2Mr(r²+a²))`,
+  `Σu^φ = 2Mar/Δ`. Emission is integrated per Mino step,
+  `dI = E_obs⁴ j Σ / E_emit³ dσ`.
 
 ### Disk
 
@@ -274,6 +303,26 @@ makes up the JMN-1 object.
    estimate `r = (4c²/(10g·ℓ_M²))^{1/3}` ≈ 0.047M. For a 10 M☉ black hole,
    10 g is already exceeded at the release point, 10M.
 
+8. **In visibility space, spin is visible and JMN-1 is not.** Infalling or
+   static gas with `j ∝ r⁻²` out to 20M, M87* scale, camera at 1000M.
+   Maximum difference in normalized visibility amplitude `|V|/V₀` out to
+   13 Gλ:
+
+   | Comparison | i | max Δ(|V|/V₀) |
+   |---|---|---|
+   | JMN-1 (R_b = 2.95M) vs Schwarzschild, static gas | 17° | 0.0051 |
+   | JMN-1 (R_b = 2.95M) vs Schwarzschild, infalling gas | 17° | 0.0001 |
+   | Kerr a = 0.9 vs Schwarzschild, infalling gas | 17° | 0.027 |
+   | Kerr a = 0.9 vs Schwarzschild, infalling gas | 80° | 0.071 |
+
+   Kerr also makes the visibilities **anisotropic**. At i = 80° and 2 Gλ,
+   |V|/V₀ = 0.112 on east-west baselines and 0.069 on north-south ones;
+   Schwarzschild gives 0.033 for both. In the image plane, the 20 μas
+   blurred residual for Kerr vs Schwarzschild is 24% (i = 17°) to 55%
+   (i = 80°) of peak. It comes from the spin-induced displacement of the
+   shadow (crescent-shaped residual), compared with ~3% for the best JMN-1
+   case.
+
 ## Validation (`cargo test`)
 
 | Test | Reference |
@@ -309,15 +358,21 @@ makes up the JMN-1 object.
 | Riemann, JMN-1 interior | Analytic `(1-M₀)α(α-2)/4r²`, `M₀/2r²`, `0`, `M₀/r²` |
 | Proper time | Schwarzschild infall from 10M matches the cycloid `τ = √(r₀³/8M)(η + sin η)` through the horizon to 10⁻³M |
 | JMN-1 power laws | Radial `r⁻²`, transverse `r^-(α+2)` for R_b = 2.5, 4 |
+| Kerr gas, a = 0 | Static (ZAMO) and infalling gas match the spherical path (< 1e-3), b = 1–15M |
+| Kerr infall velocity | `u·u = -1`, `E = 1`, `L = 0` at arbitrary (a, r, θ), to 1e-12 |
+| Visibilities | Gaussian image → Gaussian |V| (< 1e-4); thin ring's first null at the J₀ zero 2.405/(2πR) (< 1%) |
+| GPU vs CPU (`--compare`, manual) | ≤ 0.04% of pixels differ by > 16/255 for Schwarzschild (r = 30, 100M), JMN-1 R_b = 2.5 and R_b = 4 |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 
 ## Known limitations
 
-- No optically thin gas for Kerr (spherical metrics only). The Kerr camera
-  is a ZAMO and the spherical camera is a static observer; they agree as
-  `r_obs → ∞`.
+- The Kerr camera is a ZAMO and the spherical camera is a static observer;
+  they agree as `r_obs → ∞`.
+- The GPU viewer handles static spherical metrics only (no Kerr, no gas).
+  It uses f32 fixed-fraction RK4 and linear disk-crossing interpolation; it
+  is a preview, and the CPU renderer is the reference.
 - Rays reaching `r < 10⁻⁴ M` in JMN-1 count as absorbed by the singularity.
   The physics of the singularity is not modeled.
 - Stability of circular orbits is not checked directly. Novikov–Thorne
@@ -326,9 +381,13 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
   darkening.
 - Escape direction is read at `r_escape = max(10 r_obs, 1000M)`, leaving
   `O(M/r_escape)` residual bending.
-- The beam is an image-plane Gaussian, not real interferometric sampling
-  (sparse (u,v) coverage, noise, calibration). Pixel scale is small-angle;
-  use `--distance ≥ 1000` for quantitative profiles.
+- The beam is an image-plane Gaussian. Visibilities are computed on a
+  dense polar (u,v) grid as a function of baseline *length*, not on the
+  sparse tracks of real EHT stations; there is no thermal noise, gain
+  calibration or closure-quantity analysis. Pixel scale is small-angle; use
+  `--distance ≥ 1000` for quantitative profiles and visibilities, and keep
+  emission inside the field of view, because a square crop adds spurious
+  long-baseline structure.
 
 ## Roadmap
 
@@ -336,12 +395,12 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 2. ~~Optically thin emission~~ (`--gas static|infall`) ✓
 3. ~~EHT/ngEHT blur and radial profiles~~ (`--blur-fwhm`, `--profile`) ✓
 4. ~~Kerr~~ (`--metric kerr --spin a`) ✓
-4b. ~~Novikov–Thorne disk flux~~ (`--disk-model`) ✓ — next: gas for Kerr.
-5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
+4b. ~~Novikov–Thorne disk flux~~ (`--disk-model`) ✓, ~~gas for Kerr~~ ✓
+5. ~~GPU preview renderer~~ (`horizonlab-view`) ✓. Next: Kerr on the GPU.
 6. ~~Tidal tensor along radial infall~~ (`horizonlab-infall`) ✓. Not done:
    Kasner regime of *scalarized* black-hole interiors, which needs that
    model's interior field equations (an ODE system, not an analytic
    metric); non-radial infall; Kerr interior (Cauchy horizon, which is
    unstable to mass inflation).
-7. Interferometric observables (visibility amplitudes on real EHT baselines)
-   in place of a simple image-plane blur.
+7. ~~Visibility amplitudes vs baseline length~~ (`--visibilities`) ✓. Next:
+   real station (u,v) tracks, noise, closure phases.

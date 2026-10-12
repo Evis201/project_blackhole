@@ -1,0 +1,19 @@
+[package]
+name = "horizonlab-gpu"
+description = "Interactive GPU (wgpu) preview renderer for HorizonLab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "horizonlab-view"
+path = "src/main.rs"
+
+[dependencies]
+horizonlab-core = { path = "../horizonlab-core" }
+bytemuck = { version = "1.16", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.3"
+wgpu = "22.1"
+winit = "0.30.5"

@@ -113,6 +113,99 @@ pub fn radial_profile(
         .collect()
 }
 
+/// Radians per microarcsecond.
+pub const RAD_PER_UAS: f64 = 1.0 / MICROARCSEC_PER_RAD;
+
+/// Normalised visibility amplitude `|V(u,v)| / V(0)` of an image as a
+/// function of baseline length.
+///
+/// `V(u, v) = Σ I(x, y) exp(-2πi (u x + v y))`, with `(x, y)` in radians
+/// on the sky and `(u, v)` in wavelengths. Computed by direct DFT of the
+/// pixel luminance (no FFT, no padding artefacts) on a polar grid.
+pub struct VisibilityCurve {
+    /// Baseline length in Gλ.
+    pub baseline: Vec<f64>,
+    /// Mean over position angle.
+    pub mean: Vec<f64>,
+    /// East–west baselines (image x direction).
+    pub east_west: Vec<f64>,
+    /// North–south baselines (image y direction).
+    pub north_south: Vec<f64>,
+}
+
+impl VisibilityCurve {
+    /// Baseline (Gλ) of the first local minimum of the mean curve.
+    pub fn first_minimum(&self) -> Option<f64> {
+        (1..self.mean.len() - 1)
+            .find(|&i| self.mean[i] < self.mean[i - 1] && self.mean[i] <= self.mean[i + 1])
+            .map(|i| self.baseline[i])
+    }
+}
+
+/// `px_rad`: angular size of one pixel. `n_angles` must be even so that
+/// the east–west and north–south directions are sampled.
+pub fn visibility_curve(
+    pixels: &[[f32; 3]],
+    width: usize,
+    height: usize,
+    px_rad: f64,
+    max_glambda: f64,
+    n_radii: usize,
+    n_angles: usize,
+) -> VisibilityCurve {
+    use rayon::prelude::*;
+    assert!(n_angles.is_multiple_of(2) && n_radii > 0);
+    let (cx, cy) = (0.5 * width as f64, 0.5 * height as f64);
+    // Bright pixels only: (x, y, I). y grows upwards on the sky.
+    let sources: Vec<(f64, f64, f64)> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .filter_map(|(x, y)| {
+            let i = luminance(pixels[y * width + x]);
+            (i > 0.0).then_some({
+                (
+                    (x as f64 + 0.5 - cx) * px_rad,
+                    (cy - y as f64 - 0.5) * px_rad,
+                    i,
+                )
+            })
+        })
+        .collect();
+    let total: f64 = sources.iter().map(|s| s.2).sum();
+
+    let amplitude = |u: f64, v: f64| -> f64 {
+        let (mut re, mut im) = (0.0, 0.0);
+        for &(x, y, i) in &sources {
+            let (sn, cs) = (-2.0 * std::f64::consts::PI * (u * x + v * y)).sin_cos();
+            re += i * cs;
+            im += i * sn;
+        }
+        re.hypot(im) / total
+    };
+
+    let rows: Vec<(f64, f64, f64, f64)> = (0..=n_radii)
+        .into_par_iter()
+        .map(|k| {
+            let rho_gl = max_glambda * k as f64 / n_radii as f64;
+            let rho = rho_gl * 1e9;
+            let amps: Vec<f64> = (0..n_angles)
+                .map(|j| {
+                    let psi = std::f64::consts::PI * j as f64 / n_angles as f64;
+                    amplitude(rho * psi.cos(), rho * psi.sin())
+                })
+                .collect();
+            let mean = amps.iter().sum::<f64>() / n_angles as f64;
+            (rho_gl, mean, amps[0], amps[n_angles / 2])
+        })
+        .collect();
+
+    VisibilityCurve {
+        baseline: rows.iter().map(|r| r.0).collect(),
+        mean: rows.iter().map(|r| r.1).collect(),
+        east_west: rows.iter().map(|r| r.2).collect(),
+        north_south: rows.iter().map(|r| r.3).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +246,56 @@ mod tests {
         for (_, v) in prof {
             assert!((v - 0.5).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn gaussian_visibility_is_gaussian() {
+        // I ∝ exp(-x²/2σ²) ⇒ |V(ρ)| = exp(-2π² σ² ρ²).
+        let (w, h) = (128, 128);
+        let sigma_px = 4.0;
+        let px_rad = 1e-11;
+        let img: Vec<[f32; 3]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let dx = x as f64 + 0.5 - 64.0;
+                let dy = y as f64 + 0.5 - 64.0;
+                let v = (-(dx * dx + dy * dy) / (2.0 * sigma_px * sigma_px)).exp() as f32;
+                [v; 3]
+            })
+            .collect();
+        let curve = visibility_curve(&img, w, h, px_rad, 10.0, 10, 8);
+        let sigma = sigma_px * px_rad;
+        for (rho, v) in curve.baseline.iter().zip(&curve.mean) {
+            let expected =
+                (-2.0 * std::f64::consts::PI.powi(2) * (sigma * rho * 1e9).powi(2)).exp();
+            assert!(
+                (v - expected).abs() < 1e-4,
+                "ρ = {rho} Gλ: {v} vs {expected}"
+            );
+        }
+        assert_eq!(curve.mean[0], 1.0);
+    }
+
+    #[test]
+    fn thin_ring_first_null_matches_bessel_zero() {
+        // Thin ring of radius R: |V| = |J₀(2πRρ)|, first null at 2.4048/(2πR).
+        let (w, h) = (256, 256);
+        let r_px = 60.0;
+        let px_rad = 1e-11;
+        let img: Vec<[f32; 3]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let d =
+                    ((x as f64 + 0.5 - 128.0).powi(2) + (y as f64 + 0.5 - 128.0).powi(2)).sqrt();
+                [if (d - r_px).abs() < 0.5 { 1.0 } else { 0.0 }; 3]
+            })
+            .collect();
+        let curve = visibility_curve(&img, w, h, px_rad, 1.0, 200, 8);
+        let expected = 2.4048 / (2.0 * std::f64::consts::PI * r_px * px_rad) / 1e9;
+        let got = curve.first_minimum().unwrap();
+        assert!(
+            (got - expected).abs() / expected < 0.01,
+            "null {got} vs {expected} Gλ"
+        );
     }
 }

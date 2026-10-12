@@ -17,7 +17,10 @@ use clap::{Parser, ValueEnum};
 use horizonlab_core::{Jmn1, Kerr, Schwarzschild, Tolerance, TraceConfig};
 use rayon::prelude::*;
 
-use observe::{gaussian_blur, luminance, radial_profile, Source};
+use observe::{
+    gaussian_blur, luminance, radial_profile, visibility_curve, Source, VisibilityCurve,
+    RAD_PER_UAS,
+};
 use scene::{Camera, Disk, Gas, GasFlow, Outcome, Scene, Sky, Spacetime};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -136,6 +139,14 @@ struct Args {
     /// Radial bin width for --profile, in M.
     #[arg(long, default_value_t = 0.25)]
     profile_bin: f64,
+    /// Write interferometric visibility amplitude |V|/V(0) vs baseline
+    /// length (CSV), from the unblurred image at the --source scale.
+    #[arg(long)]
+    visibilities: Option<PathBuf>,
+    /// Longest baseline for --visibilities, in Gλ (EHT 230 GHz ≈ 8.5,
+    /// ngEHT 345 GHz ≈ 13).
+    #[arg(long, default_value_t = 13.0)]
+    max_baseline: f64,
 
     #[arg(short, long, default_value = "horizonlab.png")]
     out: PathBuf,
@@ -156,9 +167,6 @@ impl Args {
         &self,
         spacetime: &'a Spacetime,
     ) -> Result<Scene<'a>, Box<dyn std::error::Error>> {
-        if matches!(spacetime, Spacetime::Kerr(_)) && !matches!(self.gas, GasKind::None) {
-            return Err("--gas is only implemented for spherical metrics, not Kerr".into());
-        }
         let disk_in = self
             .disk_in
             .unwrap_or_else(|| spacetime.default_disk_inner());
@@ -316,6 +324,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Image-plane scale: apparent impact parameter b = r sin α / √A(r).
     let px_scale = scene.camera.pixel_angle(h) * args.distance / metric.lapse(args.distance);
+
+    if let Some(path) = &args.visibilities {
+        let px_rad = px_scale * args.source.theta_g_uas() * RAD_PER_UAS;
+        let curve =
+            |f: &Frame| visibility_curve(&f.pixels, w, h, px_rad, args.max_baseline, 130, 36);
+        let main_vis = curve(&frame);
+        let vs_vis = vs.as_ref().map(|(_, f)| curve(f));
+        write_visibilities(
+            path,
+            &metric.name(),
+            &main_vis,
+            vs.as_ref().map(|v| v.0.as_str()),
+            vs_vis.as_ref(),
+        )?;
+        report_visibilities(&metric.name(), &main_vis);
+        if let (Some((name, _)), Some(v)) = (&vs, &vs_vis) {
+            report_visibilities(name, v);
+            for (label, limit) in [("EHT 8.5 Gλ", 8.5), ("ngEHT 13 Gλ", 13.0)] {
+                let max_diff = main_vis
+                    .baseline
+                    .iter()
+                    .zip(main_vis.mean.iter().zip(&v.mean))
+                    .filter(|(b, _)| **b <= limit)
+                    .map(|(_, (a, b))| (a - b).abs())
+                    .fold(0.0, f64::max);
+                println!("  max |Δ|V|/V0| up to {label}: {max_diff:.4}");
+            }
+        }
+        println!("Visibilities -> {}", path.display());
+    }
     if let Some(fwhm_uas) = args.blur_fwhm {
         let theta_g = args.source.theta_g_uas();
         let sigma_px = fwhm_uas / theta_g / px_scale / (8.0 * 2f64.ln()).sqrt();
@@ -407,6 +445,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Residual panel: orange = first brighter, blue = second brighter, scaled to max |Δ|");
     println!("Done in {:.2?} -> {}", start.elapsed(), args.out.display());
+    Ok(())
+}
+
+fn report_visibilities(name: &str, v: &VisibilityCurve) {
+    let at = |g: f64| {
+        let i = v
+            .baseline
+            .iter()
+            .position(|b| *b >= g)
+            .unwrap_or(v.baseline.len() - 1);
+        v.mean[i]
+    };
+    println!(
+        "  {name}: |V|/V0 = {:.4} at 4 Gλ, {:.4} at 8.5 Gλ; first minimum {}",
+        at(4.0),
+        at(8.5),
+        v.first_minimum()
+            .map_or("beyond range".to_string(), |b| format!("at {b:.2} Gλ"))
+    );
+}
+
+fn write_visibilities(
+    path: &std::path::Path,
+    name: &str,
+    main: &VisibilityCurve,
+    vs_name: Option<&str>,
+    vs: Option<&VisibilityCurve>,
+) -> std::io::Result<()> {
+    let mut out = BufWriter::new(File::create(path)?);
+    write!(
+        out,
+        "baseline_Glambda,\"{name} mean\",\"{name} EW\",\"{name} NS\""
+    )?;
+    if let Some(n) = vs_name {
+        write!(out, ",\"{n} mean\",\"{n} EW\",\"{n} NS\"")?;
+    }
+    writeln!(out)?;
+    for i in 0..main.baseline.len() {
+        write!(
+            out,
+            "{},{},{},{}",
+            main.baseline[i], main.mean[i], main.east_west[i], main.north_south[i]
+        )?;
+        if let Some(v) = vs {
+            write!(
+                out,
+                ",{},{},{}",
+                v.mean[i], v.east_west[i], v.north_south[i]
+            )?;
+        }
+        writeln!(out)?;
+    }
     Ok(())
 }
 

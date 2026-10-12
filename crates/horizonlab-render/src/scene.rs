@@ -264,22 +264,65 @@ impl Gas {
         cur: &State,
         dl: f64,
     ) -> f64 {
-        let (r0, r1) = (prev[0], cur[0]);
+        self.clipped_trapezoid(prev[0], cur[0], dl, |first| {
+            self.integrand(metric, e_obs, if first { prev } else { cur })
+        })
+    }
+
+    /// Trapezoid rule over a step from `r0` to `r1` of parameter length `dl`,
+    /// clipped at `r_out` by linear interpolation in `r`. `q(true)` is the
+    /// integrand at the start, `q(false)` at the end.
+    fn clipped_trapezoid(&self, r0: f64, r1: f64, dl: f64, q: impl Fn(bool) -> f64) -> f64 {
         match (r0 <= self.r_out, r1 <= self.r_out) {
             (false, false) => 0.0,
-            (true, true) => {
-                0.5 * dl
-                    * (self.integrand(metric, e_obs, prev) + self.integrand(metric, e_obs, cur))
-            }
-            (true, false) => {
-                let frac = (self.r_out - r0) / (r1 - r0);
-                frac * dl * self.integrand(metric, e_obs, prev)
-            }
-            (false, true) => {
-                let frac = (self.r_out - r1) / (r0 - r1);
-                frac * dl * self.integrand(metric, e_obs, cur)
+            (true, true) => 0.5 * dl * (q(true) + q(false)),
+            (true, false) => (self.r_out - r0) / (r1 - r0) * dl * q(true),
+            (false, true) => (self.r_out - r1) / (r0 - r1) * dl * q(false),
+        }
+    }
+
+    /// Kerr: gas-frame photon energy for the received photon (`E = 1`,
+    /// `p_φ = L`, state momenta are the physical ones). `Static` means
+    /// ZAMO gas (static observers do not exist in the ergoregion; the two
+    /// coincide at `a = 0`). `Infall` is free fall from rest at infinity
+    /// with `L = Q = 0`, for which `u^θ = 0` and
+    /// `Σu^t = (r²+a²)²/Δ - a² sin²θ`, `Σu^r = -√(2Mr(r²+a²))`,
+    /// `Σu^φ = 2Mar/Δ`.
+    fn kerr_emitted_energy(&self, k: &Kerr, l: f64, y: &KerrState) -> f64 {
+        let (r, theta) = (y[0], y[1]);
+        match self.flow {
+            GasFlow::Static => kerr::zamo_energy(k, l, y),
+            GasFlow::Infall => {
+                let (m, a) = (k.m, k.a);
+                let (sigma, delta) = (k.sigma(r, theta), k.delta(r));
+                let r2a2 = r * r + a * a;
+                let s2 = theta.sin().powi(2);
+                let ut = (r2a2 * r2a2 / delta - a * a * s2) / sigma;
+                let ur = -(2.0 * m * r * r2a2).sqrt() / sigma;
+                let uphi = 2.0 * m * a * r / (delta * sigma);
+                // -p·u with p_t = -1, p_r = y[3], p_φ = L (u^θ = 0).
+                ut - y[3] * ur - l * uphi
             }
         }
+    }
+
+    /// Kerr emission over one Mino-time step: `dI = E_obs⁴ j Σ / E_emit³ dσ`.
+    fn kerr_segment(
+        &self,
+        k: &Kerr,
+        l: f64,
+        e_obs: f64,
+        prev: &KerrState,
+        cur: &KerrState,
+        dsigma: f64,
+    ) -> f64 {
+        let q = |y: &KerrState| {
+            let e_emit = self.kerr_emitted_energy(k, l, y);
+            e_obs.powi(4) * k.sigma(y[0], y[1]) / (y[0] * y[0] * e_emit.powi(3))
+        };
+        self.clipped_trapezoid(prev[0], cur[0], dsigma, |first| {
+            q(if first { prev } else { cur })
+        })
     }
 }
 
@@ -357,7 +400,7 @@ impl Scene<'_> {
 
     /// Kerr: the received photon (travelling along `-d` at the camera) is
     /// integrated backward in time in Boyer–Lindquist coordinates. The
-    /// camera is a ZAMO. Optically thin gas is not supported here.
+    /// camera is a ZAMO.
     fn shade_kerr(&self, k: &Kerr, d: Vec3) -> ([f32; 3], Outcome) {
         let cam = &self.camera;
         let theta0 = cam.pos_hat.z.clamp(-1.0, 1.0).acos();
@@ -367,7 +410,11 @@ impl Scene<'_> {
         let (y0, l) = kerr::initial_state(k, cam.r_obs, theta0, phi0, n);
         let e_obs = kerr::zamo_energy(k, l, &y0);
 
+        let mut gas_intensity = 0.0;
         let on_step = |prev: &KerrState, cur: &KerrState, ds: f64| -> Option<f64> {
+            if let Some(gas) = &self.gas {
+                gas_intensity += gas.kerr_segment(k, l, e_obs, prev, cur, ds);
+            }
             let disk = self.disk.as_ref()?;
             let equator = |y: &KerrState| y[1] - 0.5 * PI;
             if (equator(prev) > 0.0) == (equator(cur) > 0.0) {
@@ -378,7 +425,7 @@ impl Scene<'_> {
         };
 
         let res = kerr::trace(k, y0, l, -1.0, &self.trace, on_step);
-        match res.termination {
+        let (background, outcome) = match res.termination {
             Termination::Event => {
                 let r = res.event.expect("event termination carries a hit");
                 let (omega, ut) = k.circular_orbit(r).expect("checked at hit");
@@ -396,7 +443,14 @@ impl Scene<'_> {
             }
             Termination::Captured(_) => ([0.0; 3], Outcome::Horizon),
             Termination::MaxSteps | Termination::Failed(_) => ([0.0; 3], Outcome::Failed),
-        }
+        };
+        (self.add_gas(background, gas_intensity), outcome)
+    }
+
+    /// Add accumulated gas emission to a background radiance.
+    fn add_gas(&self, background: [f32; 3], intensity: f64) -> [f32; 3] {
+        let gas = self.gas.as_ref().map_or(0.0, |g| g.brightness * intensity);
+        std::array::from_fn(|i| background[i] + (GAS_COLOR[i] * gas) as f32)
     }
 
     /// Static spherical metrics: planar ray, traced forward from the camera
@@ -462,12 +516,7 @@ impl Scene<'_> {
             Termination::Captured(Capture::Singularity) => ([0.0; 3], Outcome::Singularity),
             Termination::MaxSteps | Termination::Failed(_) => ([0.0; 3], Outcome::Failed),
         };
-        let gas = self
-            .gas
-            .as_ref()
-            .map_or(0.0, |g| g.brightness * gas_intensity);
-        let radiance = std::array::from_fn(|i| background[i] + (GAS_COLOR[i] * gas) as f32);
-        (radiance, outcome)
+        (self.add_gas(background, gas_intensity), outcome)
     }
 
     /// Observed radiance from the disk at radius `r`, including gravitational
@@ -697,5 +746,45 @@ mod tests {
             (large - retro).abs() / retro < 3e-3,
             "retrograde edge {large} vs {retro}"
         );
+    }
+
+    #[test]
+    fn kerr_without_spin_gas_matches_spherical_gas() {
+        let kerr = Spacetime::Kerr(Kerr::new(1.0, 0.0));
+        let schw = Spacetime::Spherical(Box::new(Schwarzschild::new(1.0)));
+        for flow in [GasFlow::Static, GasFlow::Infall] {
+            let (sk, ss) = (gas_scene(&kerr, flow), gas_scene(&schw, flow));
+            for &b in &[1.0, 4.0, 6.0, 15.0] {
+                let d = ray_with_impact(&sk.camera, b);
+                let (ck, ok) = sk.shade(d);
+                let (cs, os) = ss.shade(d);
+                assert_eq!(ok, os, "{flow:?} b={b}");
+                let err = (ck[0] - cs[0]).abs() / cs[0];
+                assert!(err < 1e-3, "{flow:?} b={b}: {} vs {}", ck[0], cs[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn kerr_infall_velocity_is_normalised_with_zero_angular_momentum() {
+        for &(a, r, theta) in &[(0.9, 3.0, 0.4), (0.5, 1.9, 1.2), (-0.7, 8.0, 2.5)] {
+            let k = Kerr::new(1.0, a);
+            let (sigma, delta) = (k.sigma(r, theta), k.delta(r));
+            let r2a2 = r * r + a * a;
+            let s2 = f64::sin(theta).powi(2);
+            let ut = (r2a2 * r2a2 / delta - a * a * s2) / sigma;
+            let ur = -(2.0 * r * r2a2).sqrt() / sigma;
+            let uphi = 2.0 * a * r / (delta * sigma);
+            let g_tt = -(1.0 - 2.0 * r / sigma);
+            let g_tp = -2.0 * a * r * s2 / sigma;
+            let g_pp = (r2a2 + 2.0 * a * a * r * s2 / sigma) * s2;
+            let g_rr = sigma / delta;
+            let norm =
+                g_tt * ut * ut + 2.0 * g_tp * ut * uphi + g_pp * uphi * uphi + g_rr * ur * ur;
+            assert!((norm + 1.0).abs() < 1e-12, "u·u = {norm}");
+            // E = -u_t = 1, L = u_φ = 0.
+            assert!((-(g_tt * ut + g_tp * uphi) - 1.0).abs() < 1e-12);
+            assert!((g_tp * ut + g_pp * uphi).abs() < 1e-12);
+        }
     }
 }

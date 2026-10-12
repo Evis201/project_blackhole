@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/horizonlab-core", "crates/horizonlab-render"]
+members = ["crates/horizonlab-core", "crates/horizonlab-render", "crates/horizonlab-gpu"]
 
 [workspace.package]
 version = "0.1.0"
