@@ -3,10 +3,13 @@
 //! Double-precision, one geodesic per sample. Slow but exact enough to
 //! validate a future GPU (f32) renderer against.
 
+mod observe;
 mod scene;
 mod vec3;
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,6 +17,7 @@ use clap::{Parser, ValueEnum};
 use horizonlab_core::{Jmn1, Schwarzschild, SphericalMetric, Tolerance, TraceConfig};
 use rayon::prelude::*;
 
+use observe::{gaussian_blur, luminance, radial_profile, Source};
 use scene::{Camera, Disk, Gas, GasFlow, Outcome, Scene, Sky};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -98,6 +102,21 @@ struct Args {
     /// Relative tolerance of the geodesic integrator.
     #[arg(long, default_value_t = 1e-8)]
     rtol: f64,
+
+    /// Convolve with a circular Gaussian beam of this FWHM in μas
+    /// (EHT 230 GHz ≈ 20, ngEHT 345 GHz ≈ 15). Needs a distant camera
+    /// (--distance ≥ 100) so pixels map linearly to impact parameter.
+    #[arg(long)]
+    blur_fwhm: Option<f64>,
+    /// Source that sets the angular scale θ_g = GM/(c²D) for --blur-fwhm.
+    #[arg(long, value_enum, default_value = "m87")]
+    source: Source,
+    /// Write azimuthally averaged luminance vs impact parameter (CSV).
+    #[arg(long)]
+    profile: Option<PathBuf>,
+    /// Radial bin width for --profile, in M.
+    #[arg(long, default_value_t = 0.25)]
+    profile_bin: f64,
 
     #[arg(short, long, default_value = "horizonlab.png")]
     out: PathBuf,
@@ -208,10 +227,6 @@ fn print_stats(label: &str, frame: &Frame) {
     println!("  {label}: {}", summary.join(", "));
 }
 
-fn luminance(c: [f32; 3]) -> f64 {
-    0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64
-}
-
 /// Diverging colormap for `t ∈ [-1, 1]`: blue (negative) – black – orange (positive).
 fn diverging(t: f64) -> [u8; 3] {
     let t = t.clamp(-1.0, 1.0);
@@ -241,10 +256,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.inclination
     );
     let start = Instant::now();
-    let frame = render(&scene, w, h, s);
+    let mut frame = render(&scene, w, h, s);
     print_stats(&metric.name(), &frame);
 
-    let Some(vs_kind) = args.vs else {
+    let mut vs = match args.vs {
+        Some(kind) => {
+            let vs_metric = args.build_metric(kind, args.vs_rb);
+            let vs_scene = args.build_scene(vs_metric.as_ref())?;
+            println!("Rendering {} for comparison", vs_metric.name());
+            let vs_frame = render(&vs_scene, w, h, s);
+            print_stats(&vs_metric.name(), &vs_frame);
+            Some((vs_metric.name(), vs_frame))
+        }
+        None => None,
+    };
+
+    // Image-plane scale: apparent impact parameter b = r sin α / √A(r).
+    let px_scale = scene.camera.pixel_angle(h) * args.distance / metric.a(args.distance).sqrt();
+    if let Some(fwhm_uas) = args.blur_fwhm {
+        let theta_g = args.source.theta_g_uas();
+        let sigma_px = fwhm_uas / theta_g / px_scale / (8.0 * 2f64.ln()).sqrt();
+        println!(
+            "Beam: FWHM {fwhm_uas} μas = {:.2}M for {:?} (θ_g = {theta_g:.2} μas), σ = {sigma_px:.1} px",
+            fwhm_uas / theta_g,
+            args.source
+        );
+        gaussian_blur(&mut frame.pixels, w, h, sigma_px);
+        if let Some((_, f)) = vs.as_mut() {
+            gaussian_blur(&mut f.pixels, w, h, sigma_px);
+        }
+    }
+
+    if let Some(path) = &args.profile {
+        let main = radial_profile(&frame.pixels, w, h, px_scale, args.profile_bin);
+        let other = vs
+            .as_ref()
+            .map(|(_, f)| radial_profile(&f.pixels, w, h, px_scale, args.profile_bin));
+        let mut out = BufWriter::new(File::create(path)?);
+        match &vs {
+            Some((name, _)) => writeln!(out, "b_M,\"{}\",\"{}\"", metric.name(), name)?,
+            None => writeln!(out, "b_M,\"{}\"", metric.name())?,
+        }
+        for (i, (b, v)) in main.iter().enumerate() {
+            match &other {
+                Some(o) => writeln!(out, "{b},{v},{}", o[i].1)?,
+                None => writeln!(out, "{b},{v}")?,
+            }
+        }
+        println!("Profile -> {}", path.display());
+    }
+
+    let Some((vs_name, vs_frame)) = vs else {
         let mut img = image::RgbImage::new(args.width, args.height);
         for (i, c) in frame.pixels.iter().enumerate() {
             img.put_pixel((i % w) as u32, (i / w) as u32, image::Rgb(c.map(tonemap)));
@@ -253,12 +315,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Done in {:.2?} -> {}", start.elapsed(), args.out.display());
         return Ok(());
     };
-
-    let vs_metric = args.build_metric(vs_kind, args.vs_rb);
-    let vs_scene = args.build_scene(vs_metric.as_ref())?;
-    println!("Rendering {} for comparison", vs_metric.name());
-    let vs_frame = render(&vs_scene, w, h, s);
-    print_stats(&vs_metric.name(), &vs_frame);
 
     let residual: Vec<f64> = frame
         .pixels
@@ -300,7 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Residual (luminance, {} − {}): max |Δ| = {:.3e} ({:.2}% of peak), {} of {} pixels differ by > 0.1% of peak",
         metric.name(),
-        vs_metric.name(),
+        vs_name,
         max_res,
         if max_lum > 0.0 { 100.0 * max_res / max_lum } else { 0.0 },
         differing,

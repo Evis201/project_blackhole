@@ -39,6 +39,12 @@ impl Camera {
         }
     }
 
+    /// Angle subtended by one pixel at the image centre, in radians
+    /// (small-angle: exact to O(fov²) across the frame).
+    pub fn pixel_angle(&self, height: usize) -> f64 {
+        2.0 * self.tan_half_fov / height as f64
+    }
+
     /// Ray direction (unit, static-observer frame) for screen coordinates
     /// `sx ∈ [-aspect, aspect]`, `sy ∈ [-1, 1]` (y up).
     pub fn ray(&self, sx: f64, sy: f64) -> Vec3 {

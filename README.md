@@ -29,6 +29,14 @@ cargo run --release -- --metric schwarzschild --vs jmn1 --vs-rb 2.5 \
 In comparison mode, the program prints the largest luminance residual and the
 number of pixels that differ by more than 0.1% of peak.
 
+```sh
+# Simulate an observation: camera far away (pixels linear in b), field ±25M,
+# blur to a 20 μas beam at the M87* scale, plus a radial profile CSV
+cargo run --release -- --distance 1000 --fov 2.864 --width 300 --height 300 \
+    --metric schwarzschild --vs jmn1 --vs-rb 2.95 --no-disk --black-sky --gas static \
+    --blur-fwhm 20 --source m87 --profile profile.csv -o obs.png
+```
+
 All lengths are in units of the mass `M` (G = c = 1).
 
 ## Physics
@@ -117,6 +125,25 @@ makes up the JMN-1 object.
    recedes from the photon (extra redshift). These numbers change by < 1.5%
    between `rtol = 1e-6` and `1e-10`. The differing pixels are exactly the
    2792 shadow pixels (or a subset), never the photon ring.
+4. **At EHT resolution, the gap shrinks to a few percent.** Setup: M87* scale
+   (θ_g = 3.82 μas), camera at 1000M, inclination 17°, maximum residual as a
+   fraction of the blurred image's peak:
+
+   | Gas, R_b | no blur | ngEHT 15 μas (3.9M) | EHT 20 μas (5.2M) |
+   |---|---|---|---|
+   | static, 2.5M | 0.40% | 0.47% | 0.49% |
+   | static, 2.95M | 11.3% | 2.9% | 2.9% |
+   | infall, 2.5M | 0.01% | < 0.01% | < 0.01% |
+   | infall, 2.95M | 0.93% | 0.07% | 0.06% |
+
+   Radial profile, static gas, R_b = 2.95M, 20 μas beam: JMN-1 is 4.5%
+   brighter at the center, and the ratio falls to 1.00 by b ≈ 11M. The
+   brightness depression (center / ring peak) is 0.67 for JMN-1 vs 0.65 for
+   Schwarzschild. **Reading:** a 2-point contrast difference at the center is
+   far smaller than the uncertainty in the emission model (emissivity
+   profile, flow velocity). In this framework, JMN-1 with `R_b < 3M` cannot be
+   distinguished from Schwarzschild by its image alone, unless the plasma
+   model is known independently.
 
 ## Validation (`cargo test`)
 
@@ -133,6 +160,9 @@ makes up the JMN-1 object.
 | Gas transfer, M → 0 | `∫dl/r²` along a chord = `(2/b) atan(√(R²-b²)/b)`, error < 1e-3 |
 | Gas, captured ray | Infall strictly dimmer than static (`E_emit > 1/√A` pointwise) |
 | Comparison mode | Schwarzschild vs JMN-1 (R_b=2.5) with a thin disk: residual exactly 0 |
+| θ_g | M87* 3.82 μas, Sgr A* 4.84 μas (published EHT values) |
+| Gaussian beam | Flux conserved; point-source variance = σ² (4σ cutoff bias 5e-4) |
+| Radial profile | Uniform image → flat profile |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
@@ -146,12 +176,17 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
   checked (only that they exist).
 - Escape direction is read at `r_escape = max(10 r_obs, 1000M)`, leaving
   `O(M/r_escape)` residual bending.
+- The beam is an image-plane Gaussian, not real interferometric sampling
+  (sparse (u,v) coverage, noise, calibration). Pixel scale is small-angle;
+  use `--distance ≥ 1000` for quantitative profiles.
 
 ## Roadmap
 
 1. ~~Difference-map mode~~ (`--vs`) ✓
 2. ~~Optically thin emission~~ (`--gas static|infall`) ✓
-3. Image-plane profiles: radial intensity cuts and comparisons blurred to EHT/ngEHT resolution, to tell whether result 3 could be observed.
+3. ~~EHT/ngEHT blur and radial profiles~~ (`--blur-fwhm`, `--profile`) ✓
 4. Kerr (4D Hamiltonian, Boyer–Lindquist).
 5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
 6. Interior views (tidal tensor along infalling geodesics; Kasner regime).
+7. Interferometric observables (visibility amplitudes on real EHT baselines)
+   in place of a simple image-plane blur.
