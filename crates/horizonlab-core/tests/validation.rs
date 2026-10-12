@@ -18,7 +18,7 @@ fn shoot<M: SphericalMetric>(
     let (state, l) = initial_state(metric, r0, n_r, n_t);
     assert!((l - b).abs() < 1e-9 * b.max(1.0));
     let psi0 = escape_angle(metric, l, &state);
-    let res = trace(metric, state, l, cfg, |_, _| None::<()>);
+    let res = trace(metric, state, l, cfg, |_, _, _| None::<()>);
     let deflection = escape_angle(metric, l, &res.state) - psi0;
     (res, deflection)
 }

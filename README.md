@@ -20,7 +20,14 @@ cargo test --workspace
 cargo run --release -- --metric schwarzschild --distance 100 --fov 22 --inclination 82 -o schw.png
 cargo run --release -- --metric jmn1 --rb 4   --distance 100 --fov 22 --inclination 82 -o jmn1.png
 cargo run --release -- --help
+
+# Side-by-side comparison with residual map: [main | vs | main − vs]
+cargo run --release -- --metric schwarzschild --vs jmn1 --vs-rb 2.5 \
+    --no-disk --black-sky --gas static --gas-brightness 3 --distance 100 --fov 22 -o diff.png
 ```
+
+In comparison mode, the program prints the largest luminance residual and the
+number of pixels that differ by more than 0.1% of peak.
 
 All lengths are in units of the mass `M` (G = c = 1).
 
@@ -59,6 +66,24 @@ geodesics with `Ω² = A'/(2r)`. The shift factor
 intensity scales as `g⁴ F(r)`. The flux profile `F(r)` is the Newtonian
 thin-disk form, used as a placeholder.
 
+### Optically thin gas
+
+The gas is spherical, has emissivity `j ∝ r⁻²` for `r < r_out`, and does not
+absorb (after Narayan, Johnson & Gammie 2019). Bolometric transfer along the
+ray is `dI = g⁴ j dl`, with proper length in the gas frame
+`dl = E_emit dλ`, which gives `dI = E_obs⁴ j / E_emit³ dλ`. Integration uses
+the trapezoid rule over integrator steps, clipped at `r_out`. Two velocity
+fields are available:
+
+| `--gas` | Gas 4-velocity | `E_emit` (traced ray, `E = 1`) |
+|---|---|---|
+| `static` | static observer | `1/√A` |
+| `infall` | free fall from rest at ∞: `u_t = -1`, `u^r = -√((1-A)/(AB))` | `1/A + p_r u^r` |
+
+In JMN-1 the same gas model also fills the interior `r < R_b`. This is a
+kinematic assumption: it ignores the gas's interaction with the matter that
+makes up the JMN-1 object.
+
 ## Results so far
 
 1. **JMN-1 with a photon sphere (`R_b < 3M`) gives the same image as
@@ -75,6 +100,23 @@ thin-disk form, used as a placeholder.
 2. **JMN-1 without a photon sphere (`R_b > 3M`) has no shadow.** Every ray with
    `L > 0` has an interior turning point and comes back out. The center shows
    lensed sky and extra disk images.
+3. **With optically thin gas, JMN-1 (`R_b < 3M`) is brighter only inside the
+   shadow, and only by a little unless `R_b` is close to `3M`.** The extra
+   light comes from gas at `r < R_b`, seen along rays inside `b_c` before they
+   reach the singularity. Schwarzschild has no such region: those rays hit
+   the horizon. Residual vs Schwarzschild (r_obs = 100M, 400×225 px, maximum
+   luminance difference as a fraction of peak):
+
+   | R_b | static gas | infall gas |
+   |---|---|---|
+   | 2.05M | < 0.01% | < 0.01% |
+   | 2.5M | 0.38% | < 0.01% |
+   | 2.95M | 10.1% | 0.85% |
+
+   Infall suppresses the effect strongly: along captured rays the gas
+   recedes from the photon (extra redshift). These numbers change by < 1.5%
+   between `rtol = 1e-6` and `1e-10`. The differing pixels are exactly the
+   2792 shadow pixels (or a subset), never the photon ring.
 
 ## Validation (`cargo test`)
 
@@ -88,6 +130,9 @@ thin-disk form, used as a placeholder.
 | JMN-1 `R_b > 3M` | Rays pass through the interior and escape |
 | DP5 | 5th-order convergence; oscillator energy over 10 periods |
 | Metric | Analytic derivatives vs finite differences; C¹ matching at R_b |
+| Gas transfer, M → 0 | `∫dl/r²` along a chord = `(2/b) atan(√(R²-b²)/b)`, error < 1e-3 |
+| Gas, captured ray | Infall strictly dimmer than static (`E_emit > 1/√A` pointwise) |
+| Comparison mode | Schwarzschild vs JMN-1 (R_b=2.5) with a thin disk: residual exactly 0 |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
@@ -104,8 +149,9 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 
 ## Roadmap
 
-1. Difference-map mode (render two metrics with the same camera, write the residual).
-2. Optically thin emission (spherical accretion), needed for result 1 above.
-3. Kerr (4D Hamiltonian, Boyer–Lindquist).
-4. GPU preview renderer (wgpu, f32), validated against this CPU reference.
-5. Interior views (tidal tensor along infalling geodesics; Kasner regime).
+1. ~~Difference-map mode~~ (`--vs`) ✓
+2. ~~Optically thin emission~~ (`--gas static|infall`) ✓
+3. Image-plane profiles: radial intensity cuts and comparisons blurred to EHT/ngEHT resolution, to tell whether result 3 could be observed.
+4. Kerr (4D Hamiltonian, Boyer–Lindquist).
+5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
+6. Interior views (tidal tensor along infalling geodesics; Kasner regime).

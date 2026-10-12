@@ -132,7 +132,8 @@ pub struct TraceResult<T> {
 }
 
 /// Integrate a null ray until it escapes, is captured, or `on_step` returns
-/// `Some(event)`. `on_step(prev, cur)` is called after every accepted step.
+/// `Some(event)`. `on_step(prev, cur, dλ)` is called after every accepted
+/// step, with `dλ` the affine length of that step.
 pub fn trace<M, T, F>(
     metric: &M,
     state: State,
@@ -142,7 +143,7 @@ pub fn trace<M, T, F>(
 ) -> TraceResult<T>
 where
     M: SphericalMetric + ?Sized,
-    F: FnMut(&State, &State) -> Option<T>,
+    F: FnMut(&State, &State, f64) -> Option<T>,
 {
     let solver = Dopri5::new(cfg.tol);
     let f = |y: &State| rhs(metric, l, y);
@@ -161,7 +162,7 @@ where
 
     for steps in 0..cfg.max_steps {
         let h_max = cfg.max_step_frac * y[R].max(r_capture);
-        let (y_new, _taken, h_next) = match solver.adaptive_step(&f, &y, h, h_max) {
+        let (y_new, taken, h_next) = match solver.adaptive_step(&f, &y, h, h_max) {
             Ok(s) => s,
             Err(e) => {
                 // Steps collapse when a ray dives into the singular core;
@@ -193,7 +194,7 @@ where
         }
         max_constraint = max_constraint.max(hamiltonian(metric, l, &y).abs());
 
-        if let Some(event) = on_step(&prev, &y) {
+        if let Some(event) = on_step(&prev, &y, taken) {
             return finish(
                 Termination::Event,
                 y,
