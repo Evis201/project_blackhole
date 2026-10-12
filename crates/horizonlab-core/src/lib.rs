@@ -21,6 +21,7 @@ pub mod geodesic;
 pub mod integrator;
 pub mod kerr;
 pub mod metric;
+pub mod tidal;
 
 pub use disk::{EquatorialOrbits, NovikovThorne, SphericalOrbits};
 pub use geodesic::{

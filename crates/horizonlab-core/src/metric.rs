@@ -22,6 +22,11 @@ pub trait SphericalMetric: Sync {
     fn b(&self, r: f64) -> f64;
     /// `dB/dr`
     fn db(&self, r: f64) -> f64;
+    /// `d²A/dr²` (curvature needs it). Default: central difference of `A'`.
+    fn d2a(&self, r: f64) -> f64 {
+        let h = 1e-5 * r;
+        (self.da(r + h) - self.da(r - h)) / (2.0 * h)
+    }
 
     /// Rays with `r` below this radius are terminated as captured.
     fn capture_radius(&self) -> f64;
@@ -91,6 +96,9 @@ impl SphericalMetric for Schwarzschild {
     fn db(&self, r: f64) -> f64 {
         let a = self.a(r);
         -self.da(r) / (a * a)
+    }
+    fn d2a(&self, r: f64) -> f64 {
+        -4.0 * self.m / (r * r * r)
     }
     fn capture_radius(&self) -> f64 {
         self.horizon() * (1.0 + Self::HORIZON_MARGIN)
@@ -190,6 +198,13 @@ impl SphericalMetric for Jmn1 {
             self.exterior.db(r)
         } else {
             0.0
+        }
+    }
+    fn d2a(&self, r: f64) -> f64 {
+        if r >= self.rb {
+            self.exterior.d2a(r)
+        } else {
+            self.alpha * (self.alpha - 1.0) * self.a(r) / (r * r)
         }
     }
     fn capture_radius(&self) -> f64 {

@@ -4,10 +4,15 @@ description = "CPU reference renderer for HorizonLab"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "horizonlab"
 
 [[bin]]
 name = "horizonlab"
 path = "src/main.rs"
+
+[[bin]]
+name = "horizonlab-infall"
+path = "src/bin/infall.rs"
 
 [dependencies]
 horizonlab-core = { path = "../horizonlab-core" }

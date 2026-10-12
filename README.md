@@ -12,7 +12,7 @@ background sky, comparison maps and telescope-resolution blurring.
 | Crate | Purpose |
 |---|---|
 | `crates/horizonlab-core` | Metrics, Dormand–Prince 5(4) integrator with event location, planar null geodesics (spherical), Boyer–Lindquist geodesics (Kerr). No dependencies. |
-| `crates/horizonlab-render` | `horizonlab` CLI: camera, disk, sky, PNG output (rayon-parallel). |
+| `crates/horizonlab-render` | `horizonlab` CLI: camera, disk, sky, PNG output (rayon-parallel). `horizonlab-infall` CLI: tidal forces along radial free fall. |
 
 ## Quick start
 
@@ -37,6 +37,12 @@ number of pixels that differ by more than 0.1% of peak.
 cargo run --release -- --distance 1000 --fov 2.864 --width 300 --height 300 \
     --metric schwarzschild --vs jmn1 --vs-rb 2.95 --no-disk --black-sky --gas static \
     --blur-fwhm 20 --source m87 --profile profile.csv -o obs.png
+```
+
+```sh
+# Radial free fall: proper time, tidal forces, curvature (CSV optional)
+cargo run --release --bin horizonlab-infall -- --metric schwarzschild --mass-solar 4e6
+cargo run --release --bin horizonlab-infall -- --metric jmn1 --rb 2.5 --out infall.csv
 ```
 
 All lengths are in units of the mass `M` (G = c = 1).
@@ -126,6 +132,25 @@ every disk. A disk reaching further in (Kerr ISCO, JMN-1 interior) is
 therefore brighter and hotter, and images of different spacetimes can be
 compared directly. Lower `--exposure` for high-spin images, which
 saturate.
+
+### Tidal forces and interior (`tidal.rs`, `horizonlab-infall`)
+
+Riemann components in the static orthonormal frame of the spherical metric:
+
+```text
+R_t̂r̂t̂r̂ = (1/B)(A''/2A - A'²/4A² - A'B'/4AB)    R_t̂θ̂t̂θ̂ = A'/(2rAB)
+R_r̂θ̂r̂θ̂ = B'/(2rB²)                              R_θ̂φ̂θ̂φ̂ = (1 - 1/B)/r²
+```
+
+For an observer falling radially with energy `E`, the radial component is
+boost-invariant. The transverse component becomes
+`K_⊥ = R_t̂θ̂t̂θ̂ + (E²-A)/A · (AB)'/(2rAB²)`; the extra term vanishes for
+Schwarzschild (`AB = 1`). These expressions stay finite inside a horizon,
+so Schwarzschild infall is followed to `r → 0`. The tidal acceleration
+across a body of length `ℓ` is `-K ℓ` (positive = stretch, negative =
+squeeze), converted to physical units with `GM/c²`. Proper time comes from
+`(dr/dτ)² = (E²-A)/(AB)`, using the substitution `r = r₀ - u²` to remove the
+singularity at the release point.
 
 ### Optically thin gas
 
@@ -227,6 +252,28 @@ makes up the JMN-1 object.
    `M₀ < 2/3`; that is not checked here beyond `F ≥ 0` along this disk. This
    is an observable different in kind from shadow imaging.
 
+7. **Falling into a naked singularity is not gentler.** Release from rest at
+   10M, body 2 m (`horizonlab-infall`):
+
+   | | Schwarzschild | JMN-1, R_b = 2.5M (α = 4) | JMN-1, R_b = 4M (α = 1) |
+   |---|---|---|---|
+   | Kretschmann near r → 0 | ∝ r⁻⁶ | ∝ r⁻⁴ | ∝ r⁻⁴ |
+   | Radial tidal | stretch ∝ r⁻³ | **squeeze** ∝ r⁻² | stretch ∝ r⁻² |
+   | Transverse tidal | squeeze ∝ r⁻³ | squeeze ∝ **r⁻⁶** | squeeze ∝ r⁻³ |
+   | τ from 10M to 10⁻³M | 35.12M | 34.09M | 34.64M |
+
+   In JMN-1 the curvature invariant diverges more slowly than in
+   Schwarzschild, yet the transverse force *felt* diverges as `r^-(α+2)`.
+   The infaller approaches the speed of light relative to the static frame
+   (`γ² = E²/A ∝ r^-α`), which amplifies the static curvature. The radial
+   direction switches from stretching to squeezing when `α > 2`, i.e.
+   exactly when the photon sphere exists.
+
+   For Sgr A* (4·10⁶ M☉), a 2 m body crosses the horizon unharmed and
+   passes 10 g of tidal acceleration only at r = 0.046M, matching the
+   estimate `r = (4c²/(10g·ℓ_M²))^{1/3}` ≈ 0.047M. For a 10 M☉ black hole,
+   10 g is already exceeded at the release point, 10M.
+
 ## Validation (`cargo test`)
 
 | Test | Reference |
@@ -257,6 +304,11 @@ makes up the JMN-1 object.
 | Novikov–Thorne energy | `∫4π√(-g) E F dr = 1 - E(r_in)`: Schwarzschild error 2.8e-5 (matches truncation at 10⁶M), Kerr a = 0.9 error 1.3e-5 |
 | Novikov–Thorne, two paths | Kerr a = 0 vs spherical adapter: flux agrees < 1e-6; rendered disk < 1e-4 |
 | Novikov–Thorne limits | F(r_in) = 0; F → 3/(8πr³) far out |
+| Riemann, Schwarzschild | `R_trtr = -2M/r³`, `R_tθtθ = M/r³`, `K = 48M²/r⁶`, outside and inside the horizon |
+| Tidal boost invariance | Schwarzschild: (2M/r³, -M/r³) for E = 0.5…2, including r < 2M |
+| Riemann, JMN-1 interior | Analytic `(1-M₀)α(α-2)/4r²`, `M₀/2r²`, `0`, `M₀/r²` |
+| Proper time | Schwarzschild infall from 10M matches the cycloid `τ = √(r₀³/8M)(η + sin η)` through the horizon to 10⁻³M |
+| JMN-1 power laws | Radial `r⁻²`, transverse `r^-(α+2)` for R_b = 2.5, 4 |
 
 The renderer has also been checked by hand: at r_obs = 100M, the shadow area
 matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
@@ -286,6 +338,10 @@ matches the analytic angular radius `sin α = b_c √(1-2M/r)/r` to within 1%.
 4. ~~Kerr~~ (`--metric kerr --spin a`) ✓
 4b. ~~Novikov–Thorne disk flux~~ (`--disk-model`) ✓ — next: gas for Kerr.
 5. GPU preview renderer (wgpu, f32), validated against this CPU reference.
-6. Interior views (tidal tensor along infalling geodesics; Kasner regime).
+6. ~~Tidal tensor along radial infall~~ (`horizonlab-infall`) ✓. Not done:
+   Kasner regime of *scalarized* black-hole interiors, which needs that
+   model's interior field equations (an ODE system, not an analytic
+   metric); non-radial infall; Kerr interior (Cauchy horizon, which is
+   unstable to mass inflation).
 7. Interferometric observables (visibility amplitudes on real EHT baselines)
    in place of a simple image-plane blur.
