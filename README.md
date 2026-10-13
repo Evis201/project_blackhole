@@ -44,9 +44,7 @@ number of pixels that differ by more than 0.1% of peak.
 ```sh
 # Simulate an observation: camera far away (pixels linear in b), field ±25M,
 # blur to a 20 μas beam at the M87* scale, plus a radial profile CSV
-cargo run --release -- --distance 1000 --fov 2.864 --width 300 --height 300 \
-    --metric schwarzschild --vs jmn1 --vs-rb 2.95 --no-disk --black-sky --gas static \
-    --blur-fwhm 20 --source m87 --profile profile.csv -o obs.png
+cargo run --release -- --distance 1000 --fov 2.864 --width 300 --height 300 --metric schwarzschild --vs jmn1 --vs-rb 2.95 --no-disk --black-sky --gas static     --blur-fwhm 20 --source m87 --profile profile.csv -o obs.png
 ```
 
 ```sh
